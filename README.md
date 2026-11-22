@@ -1,4 +1,6 @@
 # LOCAL GI ARENA
+[Windows controller and server scripts / Windows 控制器与服务端脚本](windows-local/)
+
 [简体中文](README.zh-CN.md)
 
 LOCAL GI ARENA is a Windows project for testing Genshin Impact combat locally on a fixed 7.1 baseline. Its only supported use is combat testing: hold the party and target constant, change one build variable, then compare damage, energy or buffs.
@@ -9,8 +11,8 @@ LOCAL GI ARENA is a Windows project for testing Genshin Impact combat locally on
 
 | Area | Local 7.1 installation | In this repository draft |
 |---|---|---|
-| Characters | Search names and IDs; filter by rarity; fill missing characters; set C0–C6 individually or in batches; undo eligible recent edits | Full controller not included yet |
-| Weapons | Set refinement by filter or max out refinable four-stars; add multiple independent copies with a chosen level and refinement | Full controller not included yet |
+| Characters | Search names and IDs; filter by rarity; fill missing characters; set C0–C6 individually or in batches; undo eligible recent edits | [Windows controller sources](windows-local/); no standalone installer |
+| Weapons | Set refinement by filter or max out refinable four-stars; add multiple independent copies with a chosen level and refinement | [Windows controller sources](windows-local/); no standalone installer |
 | Artifacts | Generate a single piece or a five-piece set; select main stats per slot; tune substat rolls, match a target value, save/load recipes, choose standard or unrestricted budgets | Bilingual main-stat planner; original C# calculation and validation code and catalog-specific tests. No inventory writes or full recipe editor in the web version |
 | Combat | Server training target and DPS measurement; targeted fixes to particle counts and coordinates, recharge, HP sync, constellation state and talent notifications | A special-passive partitioning example, not the full combat engine or patch set |
 | Runtime | Local server and database, update lock and critical-file checks. After the client exits, the supervisor waits 30 seconds before requesting an orderly server and database shutdown; observed in a real session | Exit decision logic and tests only; this helper alone does not start or terminate any process |

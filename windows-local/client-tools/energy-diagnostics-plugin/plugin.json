@@ -1,0 +1,1 @@
+{"name":"LocalEnergyDiagnostics","description":"Read-only charge efficiency and particle-energy diagnostics for local UID10001; no game-state writes or new ports","version":"1.0.0","mainClass":"localenergy.LocalEnergyDiagnostics","api":2,"authors":["Local workspace"],"loadAfter":[]}
