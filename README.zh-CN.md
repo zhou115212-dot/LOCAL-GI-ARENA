@@ -1,7 +1,9 @@
 # LOCAL GI ARENA
 [English](README.md) · [搭建与启动](windows-local/distribution/README.md) · [验收记录](windows-local/distribution/ACCEPTANCE.md)
 
-面向 Windows 的《原神》7.1 国服本地战斗测试工具。固定队伍和木桩，每次只换一项命座、武器或圣遗物，比较伤害、充能和增益。与官方游戏和服务无隶属关系。
+这是一个面向 Windows 的《原神》7.1 国服本地战斗测试项目。你可以自行调整角色命座、武器精炼和圣遗物词条，测试不同数值对伤害、充能和增益的影响。部分角色的命座效果仍有未修复的 Bug，测试结果不一定与官服一致。
+
+**版本要求：** 请自行准备《原神》7.1 国服 Windows 客户端（7.1.0）。本仓库不包含游戏本体。
 
 **现在能用什么？** 想试圣遗物规划器，点 **Code → Download ZIP**，解压后打开 `planner.html`。它能规划五件套，不向背包发物品。要搭服务端，请看[Windows 组装指南](windows-local/distribution/README.md)：可以在新目录构建本机服务端、控制器和独立账号库。**仅有一个原版客户端，再下载源码 ZIP，还不是能直接玩的游戏包。** 面板可以识别客户端版本，不会修改或启动客户端。
 
