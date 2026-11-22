@@ -1,7 +1,7 @@
 # LOCAL GI ARENA
 [简体中文](README.zh-CN.md) · [Setup](windows-local/distribution/README.md) · [Test record](windows-local/distribution/ACCEPTANCE.md)
 
-LOCAL GI ARENA is a Windows project for testing combat in the Chinese version of Genshin Impact 7.1. Adjust character constellations, weapon refinement and artifact stats to see how they affect damage, energy and buffs. Some constellation effects still have known bugs, so results may differ from the official game.
+LOCAL GI ARENA is a Windows project for **comparing team compositions and team DPS (average damage per second)** in a local Genshin Impact 7.1 CN test environment. Compare teams against the same training dummy over the same time window. To test a build, keep the team and rotation fixed and change one variable at a time: a character constellation, weapon refinement, artifact set, main stat, or substat. Compare burst damage, full-rotation DPS, and energy recovery. Some constellation effects have known bugs, so results may differ from the official game.
 
 **Client requirement:** Supply your own Genshin Impact 7.1.0 Windows client for the Chinese region. The game client is not included in this repository.
 
