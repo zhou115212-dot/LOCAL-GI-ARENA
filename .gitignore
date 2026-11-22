@@ -1,0 +1,16 @@
+# Default deny. Review each new release file.
+*
+!*/
+!/LICENSE
+!/README.md
+!/README.zh-CN.md
+!/planner.html
+!/lifecycle/local-client-lifecycle.ps1
+!/lifecycle/test-local-client-lifecycle.ps1
+!/planner/ArtifactModels.cs
+!/planner/ArtifactMathTests.cs
+!/runtime-tests/start-worker.txt
+!/runtime-tests/test_wait.py
+!/server-reference/QuestProudSkillSyncHelper.java
+!/.gitignore
+!/RELEASE.md

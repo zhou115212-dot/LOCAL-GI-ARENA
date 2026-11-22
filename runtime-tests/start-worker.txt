@@ -1,0 +1,10 @@
+        # Detach the long-lived supervisor from the caller's output pipes.
+        # Redirect inside the new console so logs still have separate stdout/stderr.
+        if (($shell + $Root + $PSCommandPath) -match '["%\r\n]') { throw 'Unsupported character in supervisor path.' }
+        $si = New-Object System.Diagnostics.ProcessStartInfo
+        $si.FileName = [IO.Path]::Combine([Environment]::SystemDirectory, 'cmd.exe')
+        $si.Arguments = '/d /v:off /s /c ""' + $shell + '" ' + $a + ' 1>"' + $Root + '\logs\supervisor.out.log" 2>"' + $Root + '\logs\supervisor.err.log""'
+        $si.WorkingDirectory = $Root
+        $si.UseShellExecute = $true
+        $si.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+        $hostProcess = [Diagnostics.Process]::Start($si)
