@@ -5,6 +5,10 @@ LOCAL GI ARENA is a Windows project for testing combat in the Chinese version of
 
 **Client requirement:** Supply your own Genshin Impact 7.1.0 Windows client for the Chinese region. The game client is not included in this repository.
 
+**Client download:** [Quark Drive: 7.1.0 Windows base client for the Chinese region (Chinese voice-over included)](https://pan.quark.cn/s/c92a08de4fd5). Download all four ZIP files and extract each into the same empty folder, separate from your official installation. This is the client only; extracting it does not connect it to a local server.
+
+**Disclaimer:** LOCAL GI ARENA is an unofficial local test build for learning and discussion only. It is not affiliated with miHoYo or HoYoverse. The game and its assets belong to their respective rights holders; the project’s open-source license does not cover the game client. Some constellation effects have known bugs, so test results should not be treated as official game values.
+
 **What can I use today?** For the offline artifact worksheet, choose **Code → Download ZIP**, extract it, and open `planner.html`. It plans five pieces; it does not put them in a game inventory. For maintainers, use the [Windows assembly guide](windows-local/distribution/README.md) to build a separate localhost server, controllers and an empty account database. **A stock client and this source ZIP are not a playable game bundle.** The control panel checks the client build but does not change or launch it.
 
 | Component | Included | Tested boundary |
