@@ -1,0 +1,1494 @@
+--- a/src/main/java/emu/grasscutter/command/commands/DPSCommand.java
++++ b/src/main/java/emu/grasscutter/command/commands/DPSCommand.java
+@@ -32,6 +32,7 @@
+     public void execute(Player sender, Player targetPlayer, List<String> args) {
+         var seconds = DPSMeter.DEFAULT_SECONDS;
+         var count = 1;
++        boolean fullSpecialEnergy = false;
+ 
+         for (var arg : args) {
+             var token = arg.toLowerCase();
+@@ -41,6 +42,7 @@
+                 return;
+             }
+             if (START_WORDS.contains(token)) continue;
++            if ("full".equals(token)) { fullSpecialEnergy = true; continue; }
+ 
+             var parsedCount = matchIntOrNeg(COUNT_REGEX, token);
+             if (parsedCount != -1) {
+@@ -54,6 +56,6 @@
+             }
+         }
+ 
+-        DPSMeter.start(targetPlayer, seconds, count);
++        DPSMeter.start(targetPlayer, seconds, count, fullSpecialEnergy);
+     }
+ }
+--- a/src/main/java/emu/grasscutter/data/ResourceLoader.java
++++ b/src/main/java/emu/grasscutter/data/ResourceLoader.java
+@@ -441,6 +441,33 @@
+     }
+ 
+     private static void mergeDynamicAbilitiesIntoEmbryos() {
++    // Nicole's constellation AddAbility entries are entitlement-gated. Merging
++    // every dynamic ability into the base embryo sends C1/C2/C4/C6 abilities to
++    // C0 clients before any server-side predicate gets a chance to protect them.
++    // Keep this correction scoped to the reproduced avatar; preserve unrelated
++    // dynamic/quest behavior and let Avatar.recalcStats grant unlocked entries.
++    // Only remove a dynamic ADDITION with exclusive constellation provenance.
++    // Preserve original ConfigAvatar declarations and any non-constellation
++    // provider. Do not infer entitlement from an ability name containing C6.
++    // Excel avatar talents load after this merge, so use already-loaded configs.
++    Set<String> constellationOnlyGrants = new HashSet<>();
++    Set<String> nonConstellationGrants = new HashSet<>();
++    for (var config : GameData.getOpenConfigEntries().entrySet()) {
++        var additions = config.getValue().getAddAbilities();
++        if (additions == null) continue;
++        if (config.getKey().matches(".+_Constellation_[1-6]")) {
++            Collections.addAll(constellationOnlyGrants, additions);
++        } else {
++            Collections.addAll(nonConstellationGrants, additions);
++        }
++    }
++    constellationOnlyGrants.removeAll(nonConstellationGrants);
++    Set<String> nicoleConstellationGrants = new HashSet<>();
++    for (var config : GameData.getOpenConfigEntries().entrySet()) {
++        if (!config.getKey().startsWith("Nicole_Constellation_")) continue;
++        var additions = config.getValue().getAddAbilities();
++        if (additions != null) Collections.addAll(nicoleConstellationGrants, additions);
++    }
+ 
+     for (Map.Entry<String, AbilityEmbryoEntry> entry : GameData.getAbilityEmbryoInfo().entrySet()) {
+ 
+@@ -454,6 +481,24 @@
+             if (!abilityData.isDynamicAbility) {
+                 continue;
+             }
++            // The base list is never filtered: only a later dynamic merge is
++            // gated. Actual unlocked talents continue to grant their extras.
++            if (constellationOnlyGrants.contains(abilityData.abilityName)) {
++                continue;
++            }
++            if ("Nicole".equals(avatarName)
++                    && nicoleConstellationGrants.contains(abilityData.abilityName)) {
++                continue;
++            }
++              // QuestAbilities defines this encounter-only ability with no
++              // "Quest" in its NAME, so the older name filter misses it. Its
++              // Exit_Handler sets IsInBossRush=1, replacing normal Nahida E's
++              // SkillButtonHoldChargeMixin with Blank. Keep the definition for
++              // explicit encounter grants, but never add it to the base avatar.
++              if ("Nahida".equals(avatarName)
++                      && "Avatar_Nahida_BossRush_SpecialArt".equals(abilityData.abilityName)) {
++                  continue;
++              }
+ 
+             // Quest abilities are dynamic too, but only a quest may grant them. Avatar_Columbina_MainQuest
+             // sets a team global value that hides Slot2/Slot5 for every member, so merging it made
+--- a/src/main/java/emu/grasscutter/data/excels/ItemData.java
++++ b/src/main/java/emu/grasscutter/data/excels/ItemData.java
+@@ -148,6 +148,17 @@
+                             .toList();
+         }
+ 
++        // Conventional energy adsorbates must apply their energy action when collected.
++        // 7.1 resource data omits useOnGain. Do not auto-consume food, currency,
++        // unsupported special-energy pickups, or items with a different use target.
++        if (this.materialType == MaterialType.MATERIAL_ADSORBATE
++                && this.useTarget == ItemUseTarget.ITEM_USE_TARGET_CUR_TEAM
++                && this.itemUseActions != null
++                && this.itemUseActions.stream().anyMatch(
++                        a -> a instanceof emu.grasscutter.game.props.ItemUseAction.ItemUseAddEnergy)) {
++            this.useOnGain = true;
++        }
++
+         // 7.1 data leaves useOnGain off every avatar card and costume and most gliders, so they fell
+         // through to the "lacks isUseOnGain" branch and were thrown away: a character pulled from a
+         // wish never arrived. A card whose only job is to grant the thing is always used on gain.
+--- a/src/main/java/emu/grasscutter/game/ability/Ability.java
++++ b/src/main/java/emu/grasscutter/game/ability/Ability.java
+@@ -30,6 +30,8 @@
+ 
+     @Getter private int hash;
+     @Getter private Set<Integer> avatarSkillStartIds;
++    private String talentProfileSignature;
++    private Set<String> talentSourceKeys = new HashSet<>();
+ 
+     public Ability(AbilityData data, GameEntity owner, Player playerOwner) {
+         this.data = data;
+@@ -47,6 +49,7 @@
+         if (casterAvatar != null) {
+             applyConstellationSpecials(casterAvatar);
+             applySkillSpecials(casterAvatar);
++            rememberTalentProfile(casterAvatar);
+         }
+ 
+         hash = Utils.abilityHash(data.abilityName);
+@@ -81,6 +84,71 @@
+         }
+     }
+ 
++    private String profileSignature(Avatar avatar) {
++        return avatar.getAvatarId() + ":" + avatar.getSkillDepotId() + ":"
++            + new TreeMap<>(avatar.getSkillLevelMap()) + ":"
++            + new TreeMap<>(avatar.getProudSkillBonusMap()) + ":"
++            + new TreeSet<>(avatar.getTalentIdList()) + ":"
++            + (avatar.getProudSkillList() == null ? "" : new TreeSet<>(avatar.getProudSkillList()));
++    }
++
++    private void collectSourceKeys(Set<String> keys, emu.grasscutter.data.binout.OpenConfigEntry entry) {
++        if (entry == null || entry.getAbilityVarSetters() == null) return;
++        for (var setter : entry.getAbilityVarSetters()) {
++            if (data.abilityName.equals(setter.getAbilityName())) keys.add(setter.getVarName());
++        }
++    }
++
++    private Set<String> sourceKeysFor(Avatar avatar) {
++        var keys = new HashSet<String>();
++        var depot = GameData.getAvatarSkillDepotDataMap().get(avatar.getSkillDepotId());
++        if (depot != null) {
++            if (depot.getTalents() != null) for (int id : depot.getTalents()) {
++                var talent = GameData.getAvatarTalentDataMap().get(id);
++                if (talent != null) collectSourceKeys(keys, GameData.getOpenConfigEntries().get(talent.getOpenConfig()));
++            }
++            depot.getSkillsAndEnergySkill().forEach(id -> {
++                var skill = GameData.getAvatarSkillDataMap().get(id);
++                if (skill == null) return;
++                var proud = GameData.getProudSkillDataMap().get(skill.getProudSkillGroupId() * 100
++                    + SkillLevelResolver.getEffectiveSkillLevel(avatar, id));
++                if (proud != null) collectSourceKeys(keys, GameData.getOpenConfigEntries().get(proud.getOpenConfig()));
++            });
++        }
++        if (avatar.getProudSkillList() != null) for (int id : avatar.getProudSkillList()) {
++            var proud = GameData.getProudSkillDataMap().get(id);
++            if (proud != null) collectSourceKeys(keys, GameData.getOpenConfigEntries().get(proud.getOpenConfig()));
++        }
++        return keys;
++    }
++
++    private void rememberTalentProfile(Avatar avatar) {
++        talentProfileSignature = profileSignature(avatar);
++        talentSourceKeys = sourceKeysFor(avatar);
++    }
++
++    /** Reconcile progression constants without reconstructing the live ability.
++     * No actions, modifiers, globals, packets or stored avatar values are changed. */
++    public synchronized boolean refreshTalentSpecialsIfChanged() {
++        if (owner == null || data == null || data.abilityName == null) return false;
++        Avatar avatar = resolveCasterAvatar(playerOwner, owner);
++        if (avatar == null) return false;
++        String signature = profileSignature(avatar);
++        if (signature.equals(talentProfileSignature)) return false;
++        var newKeys = sourceKeysFor(avatar);
++        var reset = new HashSet<>(newKeys);
++        if (talentSourceKeys != null) reset.addAll(talentSourceKeys);
++        // Reset only known progression inputs, not arbitrary runtime overrides.
++        for (String key : reset) {
++            float value = data.abilitySpecials == null ? 0f : data.abilitySpecials.getOrDefault(key, 0f);
++            abilitySpecials.put(key, value);
++        }
++        applyConstellationSpecials(avatar);
++        applySkillSpecials(avatar);
++        talentProfileSignature = signature;
++        talentSourceKeys = newKeys;
++        return true;
++    }
+     private Avatar resolveCasterAvatar(Player player, GameEntity owner) {
+         EntityAvatar entity = resolveCasterEntity(player, owner);
+         return entity != null ? entity.getAvatar() : null;
+@@ -135,7 +203,7 @@
+         depot.getSkillsAndEnergySkill().forEach(skillId -> {
+             var skillData = GameData.getAvatarSkillDataMap().get(skillId);
+             if (skillData == null || skillData.getProudSkillGroupId() == 0) return;
+-            int level = skillLevelMap.getOrDefault(skillId, 1);
++            int level = SkillLevelResolver.getEffectiveSkillLevel(avatar, skillId);
+             applyOpenConfigSpecials(
+                     GameData.getProudSkillDataMap().get(skillData.getProudSkillGroupId() * 100 + level));
+         });
+--- a/src/main/java/emu/grasscutter/game/ability/AbilityManager.java
++++ b/src/main/java/emu/grasscutter/game/ability/AbilityManager.java
+@@ -255,6 +255,7 @@
+         } catch (Throwable ignored) {
+             // Character compatibility hooks are best-effort.
+         }
++        if (ability != null) ability.refreshTalentSpecialsIfChanged();
+         var handler = actionHandlers.get(action.type);
+         if (handler == null || ability == null) {
+             if (DebugConstants.LOG_MISSING_ABILITY_HANDLERS) {
+@@ -290,6 +291,7 @@
+      */
+     public void executeActionNow(
+         Ability ability, AbilityModifierAction action, ByteString abilityData, GameEntity target) {
++        if (ability != null) ability.refreshTalentSpecialsIfChanged();
+         var handler = actionHandlers.get(action.type);
+         if (handler == null || ability == null) {
+             if (DebugConstants.LOG_MISSING_ABILITY_HANDLERS) {
+@@ -311,6 +313,7 @@
+     }
+ 
+     public void executeMixin(Ability ability, AbilityMixinData mixinData, ByteString abilityData) {
++        if (ability == null || mixinData == null) return;
+ 
+         var invoke = AbilityInvokeEntry.newBuilder().setAbilityData(abilityData).build();
+         var head = invoke.getHead();
+@@ -318,7 +321,7 @@
+         GameEntity target = ability.getOwner();
+         Player player = getPlayer();
+ 
+-        if (handler == mixinHandlers.get(AbilityMixinData.Type.SwitchHealToHPDebtsMixin)) {
++        if (mixinData.type == AbilityMixinData.Type.SwitchHealToHPDebtsMixin) {
+ 
+             if (target instanceof EntityAvatar avatar) {
+ 
+@@ -350,6 +353,7 @@
+     }
+ 
+     public void onAbilityInvoke(AbilityInvokeEntry invoke) throws Exception {
++        PhlogistonStateHelper.observe(this.player, invoke);
+         if (invoke.getArgumentType()
+             == AbilityInvokeArgument.AbilityInvokeArgument_ABILITY_META_CHANGE_NYX_VALUE) {
+             NyxHelper.handleChangeNyxValue(this.player, invoke);
+@@ -601,8 +605,31 @@
+             target.setDetailAbilityInfo(detailAbility);
+         }
+ 
++        ability.refreshTalentSpecialsIfChanged();
+         var action = ability.getData().localIdToAction.get(head.getLocalId());
+         if (action != null) {
++            // Varka's client runs Copy(team mode) then Add(1) locally. It reports
++            // both scalar writes, but requests only the intermediate Copy as a
++            // server action. Replaying that lone Copy asynchronously emits the
++            // team-mode number as an ATTACK-mode number after the final client
++            // write (Water2 becomes Fire2, etc.). This invocation is an echo,
++            // not a complete authoritative conversion. Let the client's scalar
++            // reports mirror the final value; do not replay this one action.
++            // Server-owned Copy+Add bookkeeping and every other copy retain
++            // their existing execution and packet behavior.
++            if (invoke.getArgumentType() == AbilityInvokeArgument.AbilityInvokeArgument_ABILITY_NONE
++                    && invoke.getAbilityData().isEmpty()
++                    && target == entity
++                    && entity instanceof EntityAvatar avatar
++                    && avatar.getAvatar().getAvatarId() == 10000128
++                    && "Avatar_Varka_ElementalArt".equals(ability.getData().abilityName)
++                    && action.type == AbilityModifierAction.Type.CopyGlobalValue
++                    && "Caster".equals(action.srcTarget)
++                    && "Target".equals(action.dstTarget)
++                    && "_ABILITY_Avatar_Varka_TeamElem_Mode".equals(action.srcKey)
++                    && "_ABILITY_Avatar_Varka_Attack_Mode".equals(action.dstKey)) {
++                return;
++            }
+             this.executeAction(ability, action, invoke.getAbilityData(), target);
+             return;
+         } else {
+@@ -782,7 +809,7 @@
+                                     var sc = GameData.getAvatarSkillDataMap().get(sid);
+                                     return sc != null && sc.getProudSkillGroupId() == resolvedGroupId;
+                                 })
+-                                .mapToObj(sid -> avatar.getSkillLevelMap().getOrDefault(sid, 1))
++                                .mapToObj(sid -> SkillLevelResolver.getEffectiveSkillLevel(avatar, sid))
+                                 .findFirst()
+                                 .orElse(1);
+                         }
+@@ -790,7 +817,7 @@
+                         ProudSkillData proudSkill = GameData.getProudSkillDataMap().get(groupId * 100 + skillLevel);
+                         if (proudSkill == null) continue;
+                         float[] paramList = proudSkill.getParamList();
+-                        if (paramList == null || tv.paramIndex() >= paramList.length) continue;
++                        if (paramList == null || tv.paramIndex() < 0 || tv.paramIndex() >= paramList.length) continue;
+ 
+                         float value = paramList[tv.paramIndex()];
+                         computedVarOverrides.put(varName, value);
+@@ -946,6 +973,19 @@
+             if (resolvedParentName != null) {
+                 instancedAbilityData = GameData.getAbilityData(resolvedParentName);
+                 fromParentName = true;
++                // Reuse a real ability already attached to this entity. A
++                // throwaway constructor re-runs onAdded before we even locate
++                // the existing instance, resetting its state on every modifier
++                // notification. Do not borrow another party member here.
++                for (var existing : entity.getInstancedAbilities()) {
++                    if (existing != null && existing.getOwner() == entity
++                            && existing.getData() != null
++                            && resolvedParentName.equals(existing.getData().abilityName)) {
++                        instancedAbility = existing;
++                        instancedAbilityData = existing.getData();
++                        break;
++                    }
++                }
+             }
+ 
+             if (instancedAbilityData == null) {
+@@ -978,10 +1018,11 @@
+                 return;
+             }
+ 
+-            if (instancedAbility == null || fromParentName) {
++            if (instancedAbility == null) {
+                 instancedAbility = new Ability(instancedAbilityData, entity, player);
+             }
+ 
++            instancedAbility.refreshTalentSpecialsIfChanged();
+             if (instancedAbilityData.modifiers == null) {
+                 Grasscutter.getLogger().trace("handleModifierChange: modifiers map is null for ability={} entityId={}", instancedAbilityData.abilityName, invoke.getEntityId());
+                 return;
+@@ -1047,6 +1088,7 @@
+                 }
+             }
+ 
++            if (instancedAbility != null) instancedAbility.refreshTalentSpecialsIfChanged();
+             AbilityModifierController modifier =
+                 new AbilityModifierController(instancedAbility, instancedAbilityData, modifierData);
+ 
+@@ -1202,10 +1244,16 @@
+         if (entry.getKey().hasStr()) {
+             key = entry.getKey().getStr();
+         } else if (entry.getKey().hasHash()) {
+-            key = GameData.getAbilityHashes().get(entry.getKey().getHash());
++            key = entry.getKey().getHash() == Utils.abilityHash(PhlogistonStateHelper.KEY) ? PhlogistonStateHelper.KEY : GameData.getAbilityHashes().get(entry.getKey().getHash());
+         }
+ 
+         if (key == null) return;
++        // This exact client-predicted team value is an absolute snapshot, not a delta.
++        // Mirroring it twice is idempotent. Other SGVs remain server-owned and ignored.
++        if ("SGV_PlayerTeam_Phlogiston".equals(key)) {
++            PhlogistonStateHelper.acceptSnapshot(this.player, entity, entry.getFloatValue());
++            return;
++        }
+         if (key.startsWith("SGV_")) return;
+ 
+         float value = entry.getFloatValue();
+@@ -1381,7 +1429,7 @@
+ 
+         var abilities = entity.getInstancedAbilities();
+         int targetIndex = invoke.getHead().getInstancedAbilityId() - 1;
+-        if (targetIndex < 0) return;
++        if (targetIndex < 0 || targetIndex >= 4096) return;
+ 
+         while (abilities.size() < targetIndex) abilities.add(null);
+ 
+@@ -1410,8 +1458,15 @@
+             return;
+         }
+ 
+-        var newAbility = new Ability(abilityData, entity, player);
+-        if (targetIndex < abilities.size() && abilities.get(targetIndex) == null) {
++        // A repeated ADD for the same live instance is metadata recovery, not a
++        // fresh ability. Reconstructing it discards runtime overrides/modifiers.
++        var currentAbility = targetIndex < abilities.size() ? abilities.get(targetIndex) : null;
++        var newAbility = currentAbility != null && currentAbility.getOwner() == entity
++                && currentAbility.getData() != null
++                && Objects.equals(currentAbility.getData().abilityName, abilityData.abilityName)
++            ? currentAbility : new Ability(abilityData, entity, player);
++        newAbility.refreshTalentSpecialsIfChanged();
++        if (targetIndex < abilities.size()) {
+             abilities.set(targetIndex, newAbility);
+         } else {
+             abilities.add(newAbility);
+@@ -1438,7 +1493,7 @@
+                                     var sc = GameData.getAvatarSkillDataMap().get(skillId);
+                                     return sc != null && sc.getProudSkillGroupId() == resolvedGroupId;
+                                 })
+-                                .mapToObj(skillId -> avatar.getSkillLevelMap().getOrDefault(skillId, 1))
++                                .mapToObj(skillId -> SkillLevelResolver.getEffectiveSkillLevel(avatar, skillId))
+                                 .findFirst()
+                                 .orElse(1);
+                         }
+@@ -1446,7 +1501,7 @@
+                         ProudSkillData proudSkill = GameData.getProudSkillDataMap().get(groupId * 100 + skillLevel);
+                         if (proudSkill == null) continue;
+                         float[] paramList = proudSkill.getParamList();
+-                        if (paramList == null || tv.paramIndex() >= paramList.length) continue;
++                        if (paramList == null || tv.paramIndex() < 0 || tv.paramIndex() >= paramList.length) continue;
+ 
+                         float value = paramList[tv.paramIndex()];
+                         overrides.add(AbilityInvokeEntry.newBuilder()
+@@ -1541,7 +1596,7 @@
+                         var sc = GameData.getAvatarSkillDataMap().get(sid);
+                         return sc != null && sc.getProudSkillGroupId() == resolvedGroupId;
+                     })
+-                    .mapToObj(sid -> avatar.getSkillLevelMap().getOrDefault(sid, 1))
++                    .mapToObj(sid -> SkillLevelResolver.getEffectiveSkillLevel(avatar, sid))
+                     .findFirst()
+                     .orElse(1);
+             }
+@@ -1586,14 +1641,14 @@
+                             var sc = GameData.getAvatarSkillDataMap().get(sid);
+                             return sc != null && sc.getProudSkillGroupId() == resolvedGroupId;
+                         })
+-                        .mapToObj(sid -> avatar.getSkillLevelMap().getOrDefault(sid, 1))
++                        .mapToObj(sid -> SkillLevelResolver.getEffectiveSkillLevel(avatar, sid))
+                         .findFirst()
+                         .orElse(1);
+                 }
+                 ProudSkillData proudSkill = GameData.getProudSkillDataMap().get(groupId * 100 + skillLevel);
+                 if (proudSkill == null) continue;
+                 float[] paramList = proudSkill.getParamList();
+-                if (paramList == null || tv.paramIndex() >= paramList.length) continue;
++                if (paramList == null || tv.paramIndex() < 0 || tv.paramIndex() >= paramList.length) continue;
+                 result.put(tv.varName(), paramList[tv.paramIndex()]);
+             }
+         }
+--- a/src/main/java/emu/grasscutter/game/ability/AbilityMaxHpRatioHelper.java
++++ b/src/main/java/emu/grasscutter/game/ability/AbilityMaxHpRatioHelper.java
+@@ -34,6 +34,8 @@
+     /** entityId -> (modifier name -> live entry). */
+     private static final Map<Integer, Map<String, Entry>> ACTIVE = new ConcurrentHashMap<>();
+ 
++    private static final Map<Integer, Float> LAST_APPLIED_RATIO = new ConcurrentHashMap<>();
++
+     private static final ThreadLocal<Boolean> IN_APPLY = ThreadLocal.withInitial(() -> Boolean.FALSE);
+ 
+     private AbilityMaxHpRatioHelper() {}
+@@ -137,6 +139,7 @@
+     public static void clear(GameEntity entity) {
+         if (entity != null) {
+             ACTIVE.remove(entity.getId());
++            LAST_APPLIED_RATIO.remove(entity.getId());
+         }
+     }
+ 
+@@ -146,8 +149,13 @@
+         }
+         try {
+             if (entity instanceof EntityAvatar avatarEntity && avatarEntity.getAvatar() != null) {
++                // Repeated notifications of an unchanged ratio are not stat changes.
++                float ratio = totalRatio(entity);
++                if (Float.compare(ratio, LAST_APPLIED_RATIO.getOrDefault(entity.getId(), 0f)) == 0) {
++                    return;
++                }
+                 // recalcStats runs the whole stat pass and calls back into afterRecalc.
+-                avatarEntity.getAvatar().recalcStats(true);
++                avatarEntity.getAvatar().recalcStats(false);
+             } else {
+                 applyToEntity(entity, totalRatio(entity));
+             }
+@@ -167,6 +175,7 @@
+         }
+         float ratio = totalRatio(entity);
+         if (ratio == 0f) {
++            LAST_APPLIED_RATIO.put(entity.getId(), 0f);
+             return;
+         }
+         IN_APPLY.set(Boolean.TRUE);
+@@ -188,11 +197,7 @@
+             entity.setFightProperty(FightProperty.FIGHT_PROP_MAX_HP, newMax);
+             entity.setFightProperty(FightProperty.FIGHT_PROP_CUR_HP, newCur);
+ 
+-            Player player = avatar.getPlayer();
+-            if (player != null && player.hasSentLoginPackets()) {
+-                player.sendPacket(new PacketAvatarFightPropNotify(avatar));
+-                broadcastHp(entity);
+-            }
++            LAST_APPLIED_RATIO.put(entity.getId(), ratio);
+         } catch (Throwable t) {
+             Grasscutter.getLogger().warn("[MaxHPRatio] afterRecalc failed: {}", t.toString());
+         } finally {
+@@ -224,6 +229,17 @@
+         broadcastHp(entity);
+     }
+ 
++    /** Publish final scene HP only after Avatar.recalcStats completed every stat hook. */
++    public static void notifyFinalHp(Avatar avatar) {
++        if (avatar == null || avatar.getPlayer() == null || !avatar.getPlayer().hasSentLoginPackets()) {
++            return;
++        }
++        EntityAvatar entity = avatar.getAsEntity();
++        if (entity != null && LAST_APPLIED_RATIO.containsKey(entity.getId())) {
++            broadcastHp(entity);
++        }
++    }
++
+     private static void broadcastHp(GameEntity entity) {
+         if (entity == null || entity.getScene() == null) {
+             return;
+--- a/src/main/java/emu/grasscutter/game/ability/MavuikaSpiritHelper.java
++++ b/src/main/java/emu/grasscutter/game/ability/MavuikaSpiritHelper.java
+@@ -132,6 +132,30 @@
+             return;
+         }
+         long guid = avatar.getGuid();
++        // recalcStats has already rebuilt the base properties without these runtime bonuses.
++        // A C2->C1/C0 edit must discard stale state instead of resurrecting locked talents.
++        int constellation = avatar.getCoreProudSkillLevel();
++        if (constellation < 2) {
++            stopC2Keepalive(guid);
++            c2BaseAtkApplied.remove(guid);
++            c2BonusLive.remove(guid);
++            c2LastSeenBase.remove(guid);
++            Player player = avatar.getPlayer();
++            if (player != null) {
++                stopDefAura(player.getUid());
++                clearAllDefShred(player);
++            }
++        }
++        if (constellation < 1) {
++            Integer expiry = c1ExpireTask.remove(guid);
++            if (expiry != null) {
++                try { Grasscutter.getGameServer().getScheduler().cancelTask(expiry); }
++                catch (Throwable ignored) {}
++            }
++            c1AtkApplied.remove(guid);
++            c1BonusLive.remove(guid);
++            c1LastSeenAtkPct.remove(guid);
++        }
+         if (c2BaseAtkApplied.containsKey(guid)) {
+             c2BonusLive.put(guid, Boolean.FALSE);
+         }
+--- /dev/null
++++ b/src/main/java/emu/grasscutter/game/ability/PhlogistonStateHelper.java
+@@ -0,0 +1,54 @@
++package emu.grasscutter.game.ability;
++
++import emu.grasscutter.game.entity.EntityAvatar;
++import emu.grasscutter.game.entity.GameEntity;
++import emu.grasscutter.game.player.Player;
++import emu.grasscutter.net.proto.AbilityInvokeEntryOuterClass.AbilityInvokeEntry;
++import emu.grasscutter.net.proto.AbilityScalarValueEntryOuterClass.AbilityScalarValueEntry;
++import java.util.*;
++
++/** Mirrors only known absolute fuel snapshots. Never guesses opaque mixin deltas. */
++public final class PhlogistonStateHelper {
++    public static final String KEY = "SGV_PlayerTeam_Phlogiston";
++    private PhlogistonStateHelper() {}
++    private static volatile long captureUntil;
++    private static final Deque<Map<String,Object>> trace = new ArrayDeque<>();
++    public static synchronized void armCapture(int seconds) {
++        if (seconds < 0 || seconds > 120) throw new IllegalArgumentException("Capture 0..120 seconds");
++        trace.clear(); captureUntil = System.currentTimeMillis() + seconds * 1000L;
++    }
++    public static synchronized List<Map<String,Object>> diagnostics() {
++        return new ArrayList<>(trace);
++    }
++    public static void observe(Player player, AbilityInvokeEntry invoke) {
++        if (System.currentTimeMillis() >= captureUntil || player == null || player.getUid() != 10001) return;
++        try {
++            String argument = invoke.getArgumentType().name();
++            boolean relevant = argument.contains("PHLOGISTON");
++            if (argument.endsWith("GLOBAL_FLOAT_VALUE")) {
++                var scalar = AbilityScalarValueEntry.parseFrom(invoke.getAbilityData());
++                relevant = KEY.equals(scalar.getKey().getStr()) || scalar.getKey().getHash() == emu.grasscutter.utils.Utils.abilityHash(KEY);
++            }
++            if (!relevant) return;
++            var row = new LinkedHashMap<String,Object>();
++            row.put("time", java.time.Instant.now().toString()); row.put("argument", argument);
++            row.put("entityId", invoke.getEntityId()); row.put("localId", invoke.getHead().getLocalId());
++            row.put("fuelBefore", player.getPhlogistonValue());
++            row.put("payloadBytes", invoke.getAbilityData().size());
++            row.put("payloadBase64", Base64.getEncoder().encodeToString(invoke.getAbilityData().substring(0, Math.min(256, invoke.getAbilityData().size())).toByteArray()));
++            synchronized (PhlogistonStateHelper.class) { trace.addLast(row); while (trace.size() > 128) trace.removeFirst(); }
++        } catch (Exception ignored) { /* diagnostics never alter the gameplay path */ }
++    }
++    public static boolean acceptSnapshot(Player player, GameEntity source, float value) {
++        if (player == null || source == null || !Float.isFinite(value)) return false;
++        var team = player.getTeamManager();
++        if (team == null) return false;
++        boolean ownTeam = source == team.getEntity();
++        boolean ownAvatar = source instanceof EntityAvatar && team.getActiveTeam().contains(source);
++        if (!ownTeam && !ownAvatar) return false;
++        player.setPhlogistonValue(value);
++        // No echo: the client already owns this absolute snapshot. A second receipt
++        // simply overwrites with the same value, not a second fuel consumption.
++        return true;
++    }
++}
+--- a/src/main/java/emu/grasscutter/game/ability/PredicateEvaluator.java
++++ b/src/main/java/emu/grasscutter/game/ability/PredicateEvaluator.java
+@@ -30,6 +30,18 @@
+         Object typeObj = pred.get("$type");
+         if (!(typeObj instanceof String type)) return true;
+         GameEntity resolved = resolveTarget(pred, ability, owner, target);
++        if ("ByNot".equals(type) || "ByAnd".equals(type) || "ByAny".equals(type)) {
++            var children = logicalChildren(pred);
++            // Do not invert the permissive fallback for unknown client-only
++            // predicates. Only evaluate logical groups understood completely.
++            if (children == null || !knownLogicalTree(pred, 0, ability)) return true;
++            if ("ByAny".equals(type)) {
++                for (var child : children) if (evaluate(child, ability, owner, resolved, action)) return true;
++                return false;
++            }
++            boolean value = all(children, ability, owner, resolved, action);
++            return "ByNot".equals(type) ? !value : value;
++        }
+         if ("BJJDEAIEIGP".equals(type)) {
+             GameEntity caster = ability != null ? ability.getCasterEntity() : null;
+             return hasHexenzirkelTag(caster != null ? caster : (owner != null ? owner : resolved));
+@@ -38,6 +50,29 @@
+             // Prefer the predicate's target (CasterOriginOwner / Target / …); fall back to caster.
+             GameEntity talentTarget = resolveTalentParamTarget(pred, ability, owner, resolved);
+             return byUnlockTalentParam(pred, talentTarget);
++        }
++        if ("ByBigTeamHasElementType".equals(type) && understoodVarkaTeamPredicate(pred, ability)) {
++            var player = ability.getPlayerOwner();
++            if (player == null || player.getTeamManager() == null) return true;
++            String wanted = (String) pred.get("elementType");
++            int count = 0;
++            var seen = new java.util.HashSet<Integer>();
++            for (var member : player.getTeamManager().getActiveTeam()) {
++                if (member == null || member.getAvatar() == null || !seen.add(member.getId())) continue;
++                var depot = member.getAvatar().getSkillDepot();
++                if (depot != null && depot.getElementType() != null
++                        && wanted.equals(depot.getElementType().name())) count++;
++            }
++            int needed = ((Number) pred.get("number")).intValue();
++            return switch ((String) pred.get("logic")) {
++                case "GreaterOrEqual" -> count >= needed;
++                case "Greater" -> count > needed;
++                case "LesserOrEqual" -> count <= needed;
++                case "Lesser" -> count < needed;
++                case "Equal" -> count == needed;
++                case "NotEqual" -> count != needed;
++                default -> true;
++            };
+         }
+         return switch (type) {
+             case "ByHasModifier"      -> byHasModifier(pred, ability, resolved);
+@@ -45,6 +80,47 @@
+             case "ByTargetHPRatio"    -> byTargetHPRatio(pred, ability, resolved);
+             default -> true;
+         };
++    }
++
++    @SuppressWarnings("unchecked")
++    private static List<Map<String,Object>> logicalChildren(Map<String,Object> pred) {
++        Object value = pred.get("predicates");
++        if (!(value instanceof List<?> list) || list.isEmpty()) return null;
++        for (var child : list) if (!(child instanceof Map<?,?>)) return null;
++        return (List<Map<String,Object>>) (List<?>) list;
++    }
++
++    private static boolean understoodVarkaTeamPredicate(Map<String,Object> pred, Ability ability) {
++        // Deliberately narrow: this audit establishes solo active-party semantics
++        // for Varka, not every quest/co-op interpretation of "BigTeam".
++        if (ability == null || ability.getData() == null || ability.getData().abilityName == null
++                || !ability.getData().abilityName.startsWith("Avatar_Varka_")) return false;
++        if (!(pred.get("elementType") instanceof String element)
++                || !java.util.Set.of("Fire", "Water", "Electric", "Ice", "Wind", "Rock", "Grass").contains(element)) return false;
++        if (!(pred.get("number") instanceof Number n) || !Double.isFinite(n.doubleValue())
++                || n.doubleValue() != n.intValue() || n.intValue() < 0) return false;
++        if (!(pred.get("logic") instanceof String logic)
++                || !java.util.Set.of("GreaterOrEqual", "Greater", "LesserOrEqual", "Lesser", "Equal", "NotEqual").contains(logic)) return false;
++        return "Target".equals(pred.get("target"))
++                && ability.getPlayerOwner() != null && ability.getPlayerOwner().getTeamManager() != null;
++    }
++
++    private static boolean knownLogicalTree(Map<String,Object> pred, int depth, Ability ability) {
++        if (depth > 32) return false;
++        Object type = pred.get("$type");
++        if ("ByNot".equals(type) || "ByAnd".equals(type) || "ByAny".equals(type)) {
++            var children = logicalChildren(pred);
++            if (children == null) return false;
++            // Multi-child NOT grouping is not established by the local schema;
++            // leave it untouched rather than choose an AND/OR interpretation.
++            if ("ByNot".equals(type) && children.size() != 1) return false;
++            for (var child : children) if (!knownLogicalTree(child, depth + 1, ability)) return false;
++            return true;
++        }
++        return "ByBigTeamHasElementType".equals(type) && understoodVarkaTeamPredicate(pred, ability)
++            || "ByHasModifier".equals(type) || "ByTargetGlobalValue".equals(type)
++            || "ByTargetHPRatio".equals(type) || "ByUnlockTalentParam".equals(type)
++            || "BJJDEAIEIGP".equals(type);
+     }
+ 
+     private static GameEntity resolveTalentParamTarget(Map<String, Object> pred, Ability ability,
+@@ -155,12 +231,54 @@
+         if (!(mn instanceof String modifierName) || ability == null || target == null) return false;
+         for (Ability ab : target.getInstancedAbilities()) {
+             if (ab == null) continue;
+-            if (ab.getModifiers().containsKey(modifierName)) return true;
++            if (ab.getModifiers().containsKey(modifierName)
++                    && nicoleConstellationPresentIsUnlocked(ab, ab.getData())) return true;
++        }
++        // Client MODIFIER_CHANGE stores these on the entity, not necessarily
++        // inside its original Ability object. Read both representations.
++        if (target.getInstancedModifiers() != null) {
++            for (var ctrl : target.getInstancedModifiers().values()) {
++                if (ctrl == null || ctrl.getModifierData() == null || ctrl.getAbilityData() == null
++                        || ctrl.getAbilityData().modifiers == null) continue;
++                if (ctrl.getAbilityData().modifiers.get(modifierName) == ctrl.getModifierData()
++                        && nicoleConstellationPresentIsUnlocked(ctrl.getAbility(), ctrl.getAbilityData())) return true;
++            }
+         }
+         return false;
+     }
+ 
++    private static boolean nicoleConstellationPresentIsUnlocked(Ability ability,
++            emu.grasscutter.data.binout.AbilityData data) {
++        if (data == null || data.abilityName == null
++                || !data.abilityName.startsWith("Avatar_Nicole_Constellation_")) return true;
++        // The v2 entity-modifier lookup exposed stale high-constellation metadata
++        // as a genuine condition even when Nicole's actual talent set is C0.
++        // Presence is not proof of entitlement. Check the resource AddAbility
++        // mapping: its internal _1/_2 names are swapped, so do not infer a level
++        // from the suffix. Do not remove client metadata or guess an absent caster.
++        if (ability == null) return true;
++        var caster = ability.getCasterEntity();
++        if (caster == null || caster.getAvatar() == null
++                || caster.getAvatar().getAvatarId() != 10000131) return true;
++        for (int id : caster.getAvatar().getTalentIdList()) {
++            var talent = GameData.getAvatarTalentDataMap().get(id);
++            if (talent == null || talent.getOpenConfig() == null) continue;
++            var open = GameData.getOpenConfigEntries().get(talent.getOpenConfig());
++            if (open != null && open.getAddAbilities() != null)
++                for (String added : open.getAddAbilities()) if (data.abilityName.equals(added)) return true;
++        }
++        return false;
++    }
++
+     private static boolean byTargetGlobalValue(Map<String, Object> pred, Ability ability, GameEntity target) {
++        // This explicit flag reads the caster's mark, not the struck enemy's.
++        // Only avatar-owned invocation semantics are established here; leave
++        // NPC/gadget/team contexts untouched rather than guess ownership.
++        if (Boolean.TRUE.equals(pred.get("forceByCaster")) && ability != null
++                && ability.getOwner() instanceof EntityAvatar) {
++            var caster = ability.getCasterEntity();
++            if (caster != null) target = caster;
++        }
+         if (target == null) return false;
+         Object key = pred.get("key");
+         if (!(key instanceof String k)) return false;
+@@ -186,7 +304,7 @@
+             case "MoreThan", "Greater"    -> current > bound;
+             case "MoreThanAndEqual", "MoreOrEqual", "GreaterOrEqual" -> current >= bound;
+             case "LessThan", "Lesser"     -> current < bound;
+-            case "LessThanAndEqual", "LessOrEqual", "LesserOrEqual" -> current <= bound;
++            case "LessThanAndEqual", "LessOrEqual", "LesserOrEqual", "LessAndEqual" -> current <= bound;
+             case "NotEqual"               -> current != bound;
+             default                       -> current == bound;
+         };
+@@ -213,7 +331,7 @@
+         String logic = logicObj instanceof String s ? s : "Greater";
+         return switch (logic) {
+             case "Lesser", "LessThan" -> ratio < threshold;
+-            case "LesserOrEqual", "LessThanAndEqual", "LessOrEqual" -> ratio <= threshold;
++            case "LesserOrEqual", "LessThanAndEqual", "LessOrEqual", "LessAndEqual" -> ratio <= threshold;
+             case "GreaterOrEqual", "MoreThanAndEqual", "MoreOrEqual" -> ratio >= threshold;
+             case "Equal" -> Math.abs(ratio - threshold) < 1e-5f;
+             case "NotEqual" -> Math.abs(ratio - threshold) >= 1e-5f;
+--- /dev/null
++++ b/src/main/java/emu/grasscutter/game/ability/SkillLevelResolver.java
+@@ -0,0 +1,26 @@
++package emu.grasscutter.game.ability;
++
++import emu.grasscutter.data.GameData;
++import emu.grasscutter.game.avatar.Avatar;
++
++/** One effective-level policy for avatar, gadget and serialized ability parameters. */
++public final class SkillLevelResolver {
++    private SkillLevelResolver() {}
++
++    public static int getEffectiveSkillLevel(Avatar avatar, int skillId) {
++        if (avatar == null) return 1;
++        int base = Math.max(1, avatar.getSkillLevelMap().getOrDefault(skillId, 1));
++        var skill = GameData.getAvatarSkillDataMap().get(skillId);
++        if (skill == null || skill.getProudSkillGroupId() <= 0) return base;
++        int group = skill.getProudSkillGroupId();
++        int bonus = avatar.getSkillDepot() == null ? 0 :
++                Math.max(0, avatar.getProudSkillBonusMap().getOrDefault(group, 0));
++        int requested = Math.min(15, base + bonus);
++        // Incomplete or sparse dumps must not turn a valid skill into a missing row.
++        // Only fall back within this group, never into a different skill's data.
++        for (int level = requested; level >= 1; level--) {
++            if (GameData.getProudSkillDataMap().containsKey(group * 100 + level)) return level;
++        }
++        return base;
++    }
++}
+--- /dev/null
++++ b/src/main/java/emu/grasscutter/game/ability/SkillParticlePacketCompat.java
+@@ -0,0 +1,25 @@
++package emu.grasscutter.game.ability;
++import com.google.protobuf.*;
++import emu.grasscutter.net.proto.AbilityActionGenerateElemBallOuterClass.AbilityActionGenerateElemBall;
++import emu.grasscutter.net.proto.VectorOuterClass.Vector;
++
++/** Compatibility for observed 7.1 action payloads; legacy fields still take precedence. */
++public final class SkillParticlePacketCompat {
++ private SkillParticlePacketCompat(){}
++ public static AbilityActionGenerateElemBall parse(ByteString bytes)throws InvalidProtocolBufferException {
++  var parsed=AbilityActionGenerateElemBall.parseFrom(bytes);var builder=parsed.toBuilder();
++  // Captured 7.1: pos=11, rot=14. Legacy generated schema: pos=1, rot=7.
++  if(!parsed.hasPos()){var value=vector(parsed,11);if(value!=null)builder.setPos(value);}
++  if(!parsed.hasRot()){var value=vector(parsed,14);if(value!=null)builder.setRot(value);}
++  return builder.build();
++ }
++ private static Vector vector(AbilityActionGenerateElemBall parsed,int field)throws InvalidProtocolBufferException {
++  var values=parsed.getUnknownFields().getField(field).getLengthDelimitedList();
++  if(values.isEmpty())return null;
++  if(values.size()!=1)throw new InvalidProtocolBufferException("Ambiguous skill particle vector field "+field);
++  var value=Vector.parseFrom(values.get(0));
++  if(!Float.isFinite(value.getX())||!Float.isFinite(value.getY())||!Float.isFinite(value.getZ()))
++   throw new InvalidProtocolBufferException("Non-finite skill particle vector field "+field);
++  return value;
++ }
++}
+--- a/src/main/java/emu/grasscutter/game/ability/WaterResonanceHelper.java
++++ b/src/main/java/emu/grasscutter/game/ability/WaterResonanceHelper.java
+@@ -38,11 +38,8 @@
+     }
+ 
+     public static boolean hasWaterResonance(Player player) {
+-        if (player == null || player.getTeamManager() == null) {
+-            return false;
+-        }
+-        IntSet intSet = player.getTeamManager().getTeamResonances();
+-        return intSet != null && intSet.contains(ElementType.Water.getTeamResonanceId());
++        // Explicit local user preference: disable the manual dual-Water HP bonus.
++        return false;
+     }
+ 
+     public static void refresh(Player player) {
+--- a/src/main/java/emu/grasscutter/game/ability/actions/AbilityActionHandler.java
++++ b/src/main/java/emu/grasscutter/game/ability/actions/AbilityActionHandler.java
+@@ -83,7 +83,18 @@
+             case "OriginOwner", "CurLocalAvatar" -> teamManager != null
+                     ? teamManager.getCurrentAvatarEntity()
+                     : null;
+-            case "CasterOriginOwner" -> null; // TODO: Figure out.
++            case "CasterOriginOwner" -> {
++                GameEntity original = ability.getOwner();
++                var visited = new java.util.HashSet<Integer>();
++                for (int depth = 0; original instanceof EntityClientGadget gadget && depth < 8; depth++) {
++                    if (!visited.add(original.getId()) || gadget.getScene() == null) { original = null; break; }
++                    original = gadget.getScene().getEntityById(gadget.getOriginalOwnerEntityId());
++                }
++                if (original instanceof EntityAvatar) yield original;
++                // Existing named-caster lookup is preferable to the current
++                // on-field avatar, which may have changed since summon spawn.
++                yield ability.getCasterEntity();
++            }
+             default -> {
+                 Grasscutter.getLogger().debug("Unknown ability target type: {}", target);
+                 yield entity;
+--- a/src/main/java/emu/grasscutter/game/ability/actions/ActionAddGlobalValue.java
++++ b/src/main/java/emu/grasscutter/game/ability/actions/ActionAddGlobalValue.java
+@@ -19,6 +19,7 @@
+     @Override
+     public boolean execute(
+             Ability ability, AbilityModifierAction action, ByteString abilityData, GameEntity target) {
++        if (ability == null || action == null || target == null || action.key == null) return false;
+         if (action.predicates != null && !action.predicates.isEmpty()) {
+             @SuppressWarnings("unchecked")
+             List<Map<String, Object>> preds = (List<Map<String, Object>>) (List<?>) action.predicates;
+@@ -33,10 +34,18 @@
+         float currentGlobalValue = target.getGlobalAbilityValues().getOrDefault(valueKey, 0f);
+ 
+         float newValue = currentGlobalValue + valueToAdd;
+-        if (newValue > maxValue) {
++        // No bounds were supplied on 158 installed add actions. Clamping those
++        // to the default max=0 erased their counters. Keep explicitly supplied
++        // historical bounds (including the bow action lacking useLimitRange).
++        boolean maxBound = action.useLimitRange || action.maxValue != DynamicFloat.ZERO;
++        boolean minBound = action.useLimitRange || action.minValue != DynamicFloat.ZERO;
++        if (!Float.isFinite(newValue) || (maxBound && !Float.isFinite(maxValue))
++                || (minBound && !Float.isFinite(minValue))) return false;
++        if (maxBound && minBound && minValue > maxValue) return false;
++        if (maxBound && newValue > maxValue) {
+             newValue = maxValue;
+         }
+-        if (newValue < minValue) {
++        if (minBound && newValue < minValue) {
+             newValue = minValue;
+         }
+ 
+--- a/src/main/java/emu/grasscutter/game/ability/actions/ActionAddHPDebts.java
++++ b/src/main/java/emu/grasscutter/game/ability/actions/ActionAddHPDebts.java
+@@ -35,6 +35,22 @@
+         GameEntity debtTarget = target;
+         if (action.target != null && !action.target.isEmpty()) {
+             debtTarget = getTarget(ability, ability.getOwner(), action.target);
++        }
++        // The reclaim modifier is attached to a marked enemy. Its Ability.owner can
++        // therefore be that enemy; Caster is still Arlecchino, not the attachment host.
++        // Limit this compatibility correction to her exact reclaim ability and target.
++        if (!(debtTarget instanceof EntityAvatar)
++                && "Caster".equals(action.target)
++                && ability.getData() != null
++                && "Avatar_Arlecchino_ExtraAttack".equals(ability.getData().abilityName)) {
++            EntityAvatar caster = ability.getCasterEntity();
++            if (caster != null && caster.getAvatar() != null
++                    && caster.getAvatar().getAvatarId() == 10000096) {
++                debtTarget = caster;
++                Grasscutter.getLogger().info(
++                        "[BoL] reclaim Caster resolved: modifierHost={} avatar={}",
++                        ability.getOwner().getId(), caster.getId());
++            }
+         }
+         if (!(debtTarget instanceof EntityAvatar avatar)) {
+             Grasscutter.getLogger().warn("[ActionAddHPDebts] Cannot add HP debt to non-avatar entity");
+--- a/src/main/java/emu/grasscutter/game/ability/actions/ActionAttachModifier.java
++++ b/src/main/java/emu/grasscutter/game/ability/actions/ActionAttachModifier.java
+@@ -32,6 +32,13 @@
+             attachTarget = target != null ? target : ability.getOwner();
+         }
+ 
++        if (action.predicates != null && !action.predicates.isEmpty()) {
++            @SuppressWarnings("unchecked")
++            java.util.List<java.util.Map<String,Object>> predicates =
++                (java.util.List<java.util.Map<String,Object>>) (java.util.List<?>) action.predicates;
++            if (!emu.grasscutter.game.ability.PredicateEvaluator.all(
++                    predicates, ability, ability.getOwner(), attachTarget, action)) return true;
++        }
+         Grasscutter.getLogger().debug(
+                 "[Ability] AttachModifier target={} resolved={}", action.target,
+                 attachTarget != null ? attachTarget.getId() : -1);
+@@ -82,6 +89,13 @@
+         var seen = new java.util.HashSet<Integer>();
+         for (var avatarEntity : team) {
+             if (!seen.add(avatarEntity.getId())) continue;
++            if (action.predicates != null && !action.predicates.isEmpty()) {
++                @SuppressWarnings("unchecked")
++                java.util.List<java.util.Map<String,Object>> predicates =
++                    (java.util.List<java.util.Map<String,Object>>) (java.util.List<?>) action.predicates;
++                if (!emu.grasscutter.game.ability.PredicateEvaluator.all(
++                        predicates, ability, ability.getOwner(), avatarEntity, action)) continue;
++            }
+             if (hpFloor > 0f) {
+                 float maxHp = avatarEntity.getFightProperty(FightProperty.FIGHT_PROP_MAX_HP);
+                 float curHp = avatarEntity.getFightProperty(FightProperty.FIGHT_PROP_CUR_HP);
+--- a/src/main/java/emu/grasscutter/game/ability/actions/ActionClearGlobalValue.java
++++ b/src/main/java/emu/grasscutter/game/ability/actions/ActionClearGlobalValue.java
+@@ -12,6 +12,7 @@
+     @Override
+     public boolean execute(
+             Ability ability, AbilityModifierAction action, ByteString abilityData, GameEntity target) {
++        if (ability == null || action == null || target == null) return false;
+         var valueKey = action.key;
+         if (valueKey == null || valueKey.isEmpty()) {
+             return false; // Invalid key, abort execution.
+@@ -26,7 +27,8 @@
+             target.onAbilityValueUpdate();
+ 
+             // Send a value update packet to the client.
+-            if (target.getScene() != null && target.getScene().getHost() != null) {
++            if (!emu.grasscutter.game.ability.AbilityManager.isServerOwnedChain()
++                    && target.getScene() != null && target.getScene().getHost() != null) {
+                 target.getScene()
+                       .getHost()
+                       .sendPacket(new PacketServerGlobalValueChangeNotify(target, valueKey, 0.0f));
+--- a/src/main/java/emu/grasscutter/game/ability/actions/ActionCopyGlobalValue.java
++++ b/src/main/java/emu/grasscutter/game/ability/actions/ActionCopyGlobalValue.java
+@@ -12,6 +12,14 @@
+     @Override
+     public boolean execute(
+             Ability ability, AbilityModifierAction action, ByteString abilityData, GameEntity entity) {
++        if (ability == null || action == null || entity == null) return false;
++        if (action.predicates != null && !action.predicates.isEmpty()) {
++            @SuppressWarnings("unchecked")
++            java.util.List<java.util.Map<String,Object>> predicates =
++                (java.util.List<java.util.Map<String,Object>>) (java.util.List<?>) action.predicates;
++            if (!emu.grasscutter.game.ability.PredicateEvaluator.all(predicates,
++                    ability, ability.getOwner(), entity, action)) return true;
++        }
+         // Get the entities referred to.
+         var source = this.getTarget(ability, entity, action.srcTarget);
+         var destination = this.getTarget(ability, entity, action.dstTarget);
+@@ -42,8 +50,8 @@
+         // Send a value update packet.
+         var scene = entity.getScene();
+         var host = scene == null ? null : scene.getHost();
+-        if (host != null) {
+-            host.sendPacket(new PacketServerGlobalValueChangeNotify(entity, action.dstKey, value));
++        if (host != null && !emu.grasscutter.game.ability.AbilityManager.isServerOwnedChain()) {
++            host.sendPacket(new PacketServerGlobalValueChangeNotify(destination, action.dstKey, value));
+         }
+ 
+         return true;
+--- a/src/main/java/emu/grasscutter/game/ability/actions/ActionGenerateElemBall.java
++++ b/src/main/java/emu/grasscutter/game/ability/actions/ActionGenerateElemBall.java
+@@ -21,7 +21,7 @@
+ 
+         AbilityActionGenerateElemBall generateElemBall;
+         try {
+-            generateElemBall = AbilityActionGenerateElemBall.parseFrom(abilityData);
++            generateElemBall = emu.grasscutter.game.ability.SkillParticlePacketCompat.parse(abilityData);
+         } catch (InvalidProtocolBufferException e) {
+             return false;
+         }
+--- a/src/main/java/emu/grasscutter/game/ability/actions/ActionGetFightProperty.java
++++ b/src/main/java/emu/grasscutter/game/ability/actions/ActionGetFightProperty.java
+@@ -17,14 +17,16 @@
+     public boolean execute(
+         Ability ability, AbilityModifierAction action, ByteString abilityData, GameEntity target) {
+ 
++        if (ability == null || action == null) return false;
+         var owner = ability.getOwner();
+-        var resolvedTarget = target != null ? target : owner;
++        var resolvedTarget = action.target == null ? (target != null ? target : owner)
++            : resolveTarget(ability, target != null ? target : owner, action.target);
+         if (owner == null || resolvedTarget == null || action.globalValueKey == null) return false;
+         var properties = new Object2FloatOpenHashMap<String>();
+ 
+         for (var property : FightProperty.values()) {
+             String name = property.name();
+-            float value = owner.getFightProperty(property);
++            float value = resolvedTarget.getFightProperty(property);
+             properties.put(name, value);
+         }
+ 
+@@ -36,14 +38,12 @@
+                 String name = action.fightProp.toString();
+                 if (name != null && properties.containsKey(name)) fightPropertyValue = properties.getFloat(name);
+             } catch (Throwable ignored) {}
+-            if (Math.abs(fightPropertyValue) < 0.0001f) {
+-                fightPropertyValue = owner.getFightProperty(FightProperty.FIGHT_PROP_CUR_SPECIAL_ENERGY);
+-            }
+         }
+ 
+         resolvedTarget.getGlobalAbilityValues().put(action.globalValueKey, fightPropertyValue);
+         resolvedTarget.onAbilityValueUpdate();
+-        if (resolvedTarget.getScene() != null && resolvedTarget.getScene().getHost() != null) {
++        if (!emu.grasscutter.game.ability.AbilityManager.isServerOwnedChain()
++                && resolvedTarget.getScene() != null && resolvedTarget.getScene().getHost() != null) {
+             resolvedTarget.getScene().getHost().sendPacket(
+                     new PacketServerGlobalValueChangeNotify(resolvedTarget, action.globalValueKey, fightPropertyValue));
+         }
+--- a/src/main/java/emu/grasscutter/game/ability/actions/ActionNyxSet.java
++++ b/src/main/java/emu/grasscutter/game/ability/actions/ActionNyxSet.java
+@@ -27,6 +27,30 @@
+         GameEntity gameEntity3 = gameEntity2 = gameEntity != null ? gameEntity : ability.getOwner();
+         if (gameEntity2 == null) {
+             return false;
++        }
++        // Narrow repair: real Iansan NyxCycle tick/switch clears are conditional.
++        // Keep other avatars, unconditional finish actions, and Nyx amounts unchanged.
++        if (ability.getData() != null
++                && "Avatar_Iansan_NyxCycle".equals(ability.getData().abilityName)
++                && abilityModifierAction.predicates != null) {
++            for (var raw : abilityModifierAction.predicates) {
++                if (!(raw instanceof java.util.Map<?,?> pred)) continue;
++                if ("ByTargetGlobalValue".equals(pred.get("$type"))
++                        && "NyxValue".equals(pred.get("key"))
++                        && "Target".equals(pred.get("target"))
++                        && "LessAndEqual".equals(pred.get("compareType"))
++                        && pred.get("value") instanceof Number threshold) {
++                    float current = gameEntity2.getGlobalAbilityValues().getOrDefault(NYX_KEY, 0f);
++                    if (!(current <= threshold.floatValue())) return true;
++                } else if ("ByTargetIsSelf".equals(pred.get("$type"))
++                        && "CurLocalAvatar".equals(pred.get("target"))) {
++                    var player = ability.getPlayerOwner();
++                    if (player != null && player.getTeamManager() != null) {
++                        var current = player.getTeamManager().getCurrentAvatarEntity();
++                        if (current != null && current.getId() != gameEntity2.getId()) return true;
++                    }
++                }
++            }
+         }
+         Object2FloatOpenHashMap<String> object2FloatOpenHashMap = new Object2FloatOpenHashMap<String>();
+         for (FightProperty fightProperty : FightProperty.values()) {
+--- a/src/main/java/emu/grasscutter/game/ability/actions/ActionSetGlobalValue.java
++++ b/src/main/java/emu/grasscutter/game/ability/actions/ActionSetGlobalValue.java
+@@ -30,10 +30,42 @@
+     @Override
+     public boolean execute(
+             Ability ability, AbilityModifierAction action, ByteString abilityData, GameEntity target) {
++                if (ability == null || action == null || target == null
++                        || action.key == null || action.key.isEmpty()) return false;
++                if (action.predicates != null && !action.predicates.isEmpty()) {
++                    @SuppressWarnings("unchecked")
++                    java.util.List<java.util.Map<String,Object>> predicates =
++                        (java.util.List<java.util.Map<String,Object>>) (java.util.List<?>) action.predicates;
++                    if (!emu.grasscutter.game.ability.PredicateEvaluator.all(
++                            predicates, ability, ability.getOwner(), target, action)) return true;
++                }
+                 var properties = propertiesFor(ability);
++
++                // The installed stat pass has no NONEXTRA_ATTACK entry. Iansan's
++                // real Q expression reads it, so overwriting the client value
++                // with a server-computed zero erased her attack buff. Derive
++                // only the missing ordinary-attack input; never include a
++                // converted extra-attack term or replace an explicit zero.
++                if ("_IansanAttackUpValue".equals(action.key) && ability.getOwner() != null
++                        && !ability.getOwner().getFightProperties().containsKey(
++                            FightProperty.FIGHT_PROP_NONEXTRA_ATTACK.getId())) {
++                    var caster = ability.getOwner();
++                    float attack = caster.getFightProperty(FightProperty.FIGHT_PROP_BASE_ATTACK)
++                        * (1f + caster.getFightProperty(FightProperty.FIGHT_PROP_ATTACK_PERCENT))
++                        + caster.getFightProperty(FightProperty.FIGHT_PROP_ATTACK);
++                    if (Float.isFinite(attack)) properties.put("FIGHT_PROP_NONEXTRA_ATTACK", attack);
++                }
+ 
+                 var valueKey = action.key;
+                 float computedValue = action.writtenValue().get(properties, 0f);
++                if (!Float.isFinite(computedValue)) return false;
++                // This Q has an explicit cap in its real resource. Keep other
++                // historical SetGlobalValue clamp behavior outside this repair.
++                if ("_IansanAttackUpValue".equals(valueKey) && action.useLimitRange) {
++                    float maximum = action.maxValue.get(properties, 0f);
++                    if (!Float.isFinite(computedValue) || !Float.isFinite(maximum) || maximum < 0f) return false;
++                    computedValue = Math.max(0f, Math.min(maximum, computedValue));
++                }
+                 Player owner = ability != null ? ability.getPlayerOwner() : null;
+                 if (owner == null && target != null && target.getScene() != null) {
+                     owner = target.getScene().getHost();
+--- a/src/main/java/emu/grasscutter/game/ability/actions/ActionSetRandomOverrideMapValue.java
++++ b/src/main/java/emu/grasscutter/game/ability/actions/ActionSetRandomOverrideMapValue.java
+@@ -13,13 +13,15 @@
+     public boolean execute(
+             Ability ability, AbilityModifierAction action, ByteString abilityData, GameEntity target) {
+         AbilityActionSetRandomOverrideMapValue valueProto;
++        float value;
+         try {
+             valueProto = AbilityActionSetRandomOverrideMapValue.parseFrom(abilityData);
++            value = readCompatibleRandomValue(abilityData, valueProto);
+         } catch (InvalidProtocolBufferException e) {
+             return false;
+         }
+ 
+-        float value = valueProto.getRandomValue();
++
+         if (!isWithinRange(ability, action, value)) {
+             Grasscutter.getLogger()
+                     .warn(
+@@ -43,6 +45,21 @@
+      * must never be read as zero: that would reject every non-zero roll and leave the entity
+      * without its random value, which is the same visible bug without the stack trace.
+      */
++    // 7.1 sends this float in field 13; retain legacy field 4 including explicit zero.
++    static float readCompatibleRandomValue(ByteString bytes,
++            AbilityActionSetRandomOverrideMapValue parsed) throws InvalidProtocolBufferException {
++        var input = bytes.newCodedInput();
++        try {
++            for (int tag; (tag = input.readTag()) != 0;) {
++                if (tag == ((4 << 3) | 5)) return parsed.getRandomValue();
++                if (!input.skipField(tag)) break;
++            }
++        } catch (java.io.IOException ex) {
++            throw new InvalidProtocolBufferException(ex);
++        }
++        var values = parsed.getUnknownFields().getField(13).getFixed32List();
++        return values.size() == 1 ? Float.intBitsToFloat(values.get(0)) : parsed.getRandomValue();
++    }
+     static boolean isWithinRange(Ability ability, AbilityModifierAction action, float value) {
+         if (action.valueRangeMin == null || action.valueRangeMax == null) {
+             return true;
+--- a/src/main/java/emu/grasscutter/game/avatar/Avatar.java
++++ b/src/main/java/emu/grasscutter/game/avatar/Avatar.java
+@@ -825,6 +825,16 @@
+ 
+ 
+ 
++        // Complete HP/stat hooks before publishing anything. A pre-buff HP packet followed
++        // by a buffed HP packet creates artificial HP changes for reactive abilities.
++        runRecalcHook("MaxHPRatio afterRecalc", () -> AbilityMaxHpRatioHelper.afterRecalc(this));
++        runRecalcHook("WaterResonance afterRecalc", () -> WaterResonanceHelper.afterRecalc(this));
++        AvatarStatePersist.afterRecalc(this);
++        runRecalcHook("Symphonist recalc hook", () -> SymphonistWeaponHelper.onAfterRecalc(this));
++        runRecalcHook("Mavuika afterRecalc", () -> emu.grasscutter.game.ability.MavuikaSpiritHelper.onAfterRecalc(this));
++
++
++
+         // Packet
+         if (getPlayer() != null && getPlayer().hasSentLoginPackets()) {
+             // Update stats for client
+@@ -838,10 +848,7 @@
+             }
+         }
+ 
+-        runRecalcHook("Symphonist recalc hook", () -> SymphonistWeaponHelper.onAfterRecalc(this));
+-        runRecalcHook("MaxHPRatio afterRecalc", () -> AbilityMaxHpRatioHelper.afterRecalc(this));
+-        runRecalcHook("WaterResonance afterRecalc", () -> WaterResonanceHelper.afterRecalc(this));
+-        AvatarStatePersist.afterRecalc(this);
++        AbilityMaxHpRatioHelper.notifyFinalHp(this);
+     }
+ 
+     /**
+@@ -1200,7 +1207,8 @@
+                         .setSkillDepotId(this.getSkillDepotId())
+                         .setCoreProudSkillLevel(this.getCoreProudSkillLevel())
+                         .putAllSkillLevelMap(this.getSkillLevelMap())
+-                        .addAllInherentProudSkillList(this.getProudSkillList())
++                        .addAllInherentProudSkillList(emu.grasscutter.game.avatar.QuestProudSkillSyncHelper.inherent(this))
++                        .addAllSpecialProudSkillList(emu.grasscutter.game.avatar.QuestProudSkillSyncHelper.special(this))
+                         .putAllProudSkillExtraLevelMap(this.getProudSkillBonusMap())
+                         .setAvatarType(this.getAvatarType())
+                         .setBornTime(this.getBornTime())
+@@ -1256,7 +1264,8 @@
+                         .putAllFightPropMap(this.getFightProperties())
+                         .setSkillDepotId(this.getSkillDepotId())
+                         .setCoreProudSkillLevel(this.getCoreProudSkillLevel())
+-                        .addAllInherentProudSkillList(this.getProudSkillList())
++                        .addAllInherentProudSkillList(emu.grasscutter.game.avatar.QuestProudSkillSyncHelper.inherent(this))
++                        .addAllSpecialProudSkillList(emu.grasscutter.game.avatar.QuestProudSkillSyncHelper.special(this))
+                         .putAllSkillLevelMap(this.getSkillLevelMap())
+                         .putAllProudSkillExtraLevelMap(this.getProudSkillBonusMap())
+                         .setFetterInfo(avatarFetter)
+--- /dev/null
++++ b/src/main/java/emu/grasscutter/game/avatar/QuestProudSkillSyncHelper.java
+@@ -0,0 +1,32 @@
++package emu.grasscutter.game.avatar;
++
++import emu.grasscutter.data.GameData;
++import java.util.List;
++import java.util.TreeSet;
++
++/** Wire-only partition of already unlocked passives. Never grants talents, edits
++ * quests, changes saved state, or guesses packet fields. Uses existing generated
++ * protocol builders for inventory, scene, showcase and depot notifications. */
++public final class QuestProudSkillSyncHelper {
++    private QuestProudSkillSyncHelper() {}
++
++    public static List<Integer> special(Avatar avatar) {
++        if (avatar == null || avatar.getSkillDepot() == null
++                || avatar.getProudSkillList() == null) return List.of();
++        var groups = avatar.getSkillDepot().getQuestProudSkillGroupIds();
++        if (groups == null || groups.isEmpty()) return List.of();
++        var result = new TreeSet<Integer>();
++        for (int id : avatar.getProudSkillList()) {
++            if (id > 0 && groups.contains(id / 100)
++                    && GameData.getProudSkillDataMap().containsKey(id)) result.add(id);
++        }
++        return List.copyOf(result);
++    }
++
++    public static List<Integer> inherent(Avatar avatar) {
++        if (avatar == null || avatar.getProudSkillList() == null) return List.of();
++        var result = new TreeSet<Integer>(avatar.getProudSkillList());
++        result.removeAll(special(avatar));
++        return List.copyOf(result);
++    }
++}
+--- a/src/main/java/emu/grasscutter/game/dps/DPSMeter.java
++++ b/src/main/java/emu/grasscutter/game/dps/DPSMeter.java
+@@ -104,6 +104,11 @@
+      * @param targetCount number of targets, clamped to [1, {@value MAX_TARGETS}]
+      */
+     public static void start(Player player, int seconds, int targetCount) {
++        start(player, seconds, targetCount, false);
++    }
++
++    /** Explicit full special-energy preset; ordinary dps/chat usage stays unchanged. */
++    public static void start(Player player, int seconds, int targetCount, boolean fullSpecialEnergy) {
+         if (player == null) {
+             CommandHandler.sendMessage(null, "A DPS test can only be started by a player.");
+             return;
+@@ -142,7 +147,7 @@
+         triggers.add(new DPSTimeTrigger()); // settle when the timer runs out
+ 
+         // Reset the party before starting so leftover low HP or spent bursts do not skew the reading.
+-        player.getTeamManager().getActiveTeam().forEach(DPSMeter::resetForTest);
++        player.getTeamManager().getActiveTeam().forEach(e -> resetForTest(e, fullSpecialEnergy));
+ 
+         var challenge =
+                 new DPSChallenge(
+@@ -173,12 +178,27 @@
+     }
+ 
+     private static void resetForTest(EntityAvatar entity) {
++        resetForTest(entity, false);
++    }
++
++    private static void resetForTest(EntityAvatar entity, boolean fullSpecialEnergy) {
+         var player = entity.getPlayer();
+         if (!entity.isAlive() && player != null) {
+             player.getTeamManager().reviveAvatar(entity.getAvatar());
+         }
+         entity.heal(entity.getFightProperty(FightProperty.FIGHT_PROP_MAX_HP), true);
+         entity.addEnergy(100f, PropChangeReason.PropChangeReason_PROP_CHANGE_ENERGY_BALL);
++        if (fullSpecialEnergy) {
++            float maximum = entity.getFightProperty(FightProperty.FIGHT_PROP_MAX_SPECIAL_ENERGY);
++            if (Float.isFinite(maximum) && maximum > 0f) {
++                // Do not use setCurrentEnergy: that also persists ordinary energy.
++                entity.setFightProperty(FightProperty.FIGHT_PROP_CUR_SPECIAL_ENERGY, maximum);
++                emu.grasscutter.game.ability.SpecialEnergyBarHelper.ensureAndSync(entity);
++                if (entity.getAvatar().getAvatarId() == 10000114) {
++                    emu.grasscutter.game.ability.SkirkCunningHelper.syncNyxFromSpecial(entity);
++                }
++            }
++        }
+         entity
+                 .getWorld()
+                 .broadcastPacket(
+--- a/src/main/java/emu/grasscutter/game/entity/EntityAvatar.java
++++ b/src/main/java/emu/grasscutter/game/entity/EntityAvatar.java
+@@ -346,7 +346,8 @@
+                         .setCoreProudSkillLevel(avatar.getCoreProudSkillLevel())
+                         .putAllSkillLevelMap(avatar.getSkillLevelMap())
+                         .setSkillDepotId(avatar.getSkillDepotId())
+-                        .addAllInherentProudSkillList(avatar.getProudSkillList())
++                        .addAllInherentProudSkillList(emu.grasscutter.game.avatar.QuestProudSkillSyncHelper.inherent(avatar))
++                        .addAllSpecialProudSkillList(emu.grasscutter.game.avatar.QuestProudSkillSyncHelper.special(avatar))
+                         .putAllProudSkillExtraLevelMap(avatar.getProudSkillBonusMap())
+                         .addAllTeamResonanceList(player.getTeamManager().getTeamResonances())
+                         .setWearingFlycloakId(avatar.getFlyCloak())
+--- a/src/main/java/emu/grasscutter/game/inventory/Inventory.java
++++ b/src/main/java/emu/grasscutter/game/inventory/Inventory.java
+@@ -138,6 +138,14 @@
+             }
+             var params = new UseItemParams(this.player, data.getUseTarget());
+             params.usedItemId = data.getId();
++            // Energy drops may bundle multiple particles. Preserve that multiplicity;
++            // keep character cards/costumes and other one-shot auto-use items unchanged.
++            if (data.getMaterialType() == MaterialType.MATERIAL_ADSORBATE
++                    && data.getItemUseActions() != null
++                    && data.getItemUseActions().stream().anyMatch(
++                            a -> a instanceof emu.grasscutter.game.props.ItemUseAction.ItemUseAddEnergy)) {
++                params.count = Math.max(1, item.getCount());
++            }
+             boolean used =
+                     this.player.getServer().getInventorySystem().useItemDirect(data, params);
+             if (!used) {
+@@ -369,6 +377,14 @@
+             // addItems() / other putItem callers still consume useOnGain materials.
+             var params = new UseItemParams(this.player, data.getUseTarget());
+             params.usedItemId = data.getId();
++            // Energy drops may bundle multiple particles. Preserve that multiplicity;
++            // keep character cards/costumes and other one-shot auto-use items unchanged.
++            if (data.getMaterialType() == MaterialType.MATERIAL_ADSORBATE
++                    && data.getItemUseActions() != null
++                    && data.getItemUseActions().stream().anyMatch(
++                            a -> a instanceof emu.grasscutter.game.props.ItemUseAction.ItemUseAddEnergy)) {
++                params.count = Math.max(1, item.getCount());
++            }
+             this.player.getServer().getInventorySystem().useItemDirect(data, params);
+             return null;
+         }
+--- a/src/main/java/emu/grasscutter/game/managers/energy/EnergyManager.java
++++ b/src/main/java/emu/grasscutter/game/managers/energy/EnergyManager.java
+@@ -133,7 +133,7 @@
+             throws InvalidProtocolBufferException {
+ 
+         AbilityActionGenerateElemBall action =
+-                AbilityActionGenerateElemBall.parseFrom(invoke.getAbilityData());
++                emu.grasscutter.game.ability.SkillParticlePacketCompat.parse(invoke.getAbilityData());
+         if (action == null) {
+             return;
+         }
+@@ -443,15 +443,16 @@
+     }
+ 
+     private void generateElemBall(int ballId, Position position, int count) {
+-
+         ItemData itemData = GameData.getItemDataMap().get(ballId);
+-        if (itemData == null) {
+-            return;
+-        }
+-
+-        EntityItem energyBall =
+-                new EntityItem(this.getPlayer().getScene(), this.getPlayer(), itemData, position, count);
+-        this.getPlayer().getScene().addEntity(energyBall);
++        if (itemData == null || count <= 0) {
++            return;
++        }
++        // One visible drop per particle, not one visual object carrying an invisible stack.
++        for (int i = 0; i < count; i++) {
++            EntityItem energyBall = new EntityItem(
++                    this.getPlayer().getScene(), this.getPlayer(), itemData, new Position(position), 1);
++            this.getPlayer().getScene().addEntity(energyBall);
++        }
+     }
+ 
+     private Optional<EntityAvatar> getCastingAvatarEntityForEnergy(int invokeEntityId) {
+--- a/src/main/java/emu/grasscutter/game/player/Player.java
++++ b/src/main/java/emu/grasscutter/game/player/Player.java
+@@ -248,7 +248,7 @@
+     @Getter @Setter private ElementType mainCharacterElement = ElementType.None;
+ 
+     @Getter @Setter private Map<Integer, CityInfoData> cityInfoData;
+-    @Getter private float phlogistonValue = 100.0f; // 燃素值
++    private float phlogistonValue = 100.0f; // 燃素值
+ 
+     @Deprecated
+     @SuppressWarnings({"rawtypes", "unchecked"})
+@@ -372,13 +372,21 @@
+     public Player getPlayer() {
+         return this;
+     }
++    // Player properties persist in 1/100 units; team SGVs use the 0..100 scale.
++    public float getPhlogistonValue() {
++        if (this.properties != null && this.properties.containsKey(PlayerProperty.PROP_CUR_PHLOGISTON.getId())) {
++            return Math.max(0f, Math.min(100f, this.properties.get(PlayerProperty.PROP_CUR_PHLOGISTON.getId()) / 100f));
++        }
++        return Float.isFinite(this.phlogistonValue) ? Math.max(0f, Math.min(100f, this.phlogistonValue)) : 100f;
++    }
++
+     public void setPhlogistonValue(float value) {
+-        if (value < 0) value = 0;
+-        else if (value > 100) value = 100;
+-
+-        if (value == this.phlogistonValue) return;
+-
++        if (!Float.isFinite(value)) return;
++        value = Math.max(0f, Math.min(100f, value));
+         this.phlogistonValue = value;
++        if (this.properties != null) {
++            this.properties.put(PlayerProperty.PROP_CUR_PHLOGISTON.getId(), Math.round(value * 100f));
++        }
+     }
+ 
+     public float addPhlogistonValue(float amount) {
+@@ -649,8 +657,9 @@
+             this.getProperty(PlayerProperty.PROP_MAX_STAMINA));
+         this.setProperty(PlayerProperty.PROP_DIVE_CUR_STAMINA,
+                 this.getProperty(PlayerProperty.PROP_DIVE_MAX_STAMINA));
++        // Keep a persisted zero too: generic setOrFetch deliberately treats zero as absent.
+         this.setProperty(PlayerProperty.PROP_CUR_PHLOGISTON,
+-            this.getProperty(PlayerProperty.PROP_PHLOGISTON_MAX_VALUE));
++            Math.round(this.getPhlogistonValue() * 100f), false);
+     }
+ 
+     private void applyStartingSceneTags() {
+@@ -1686,6 +1695,8 @@
+     }
+ 
+     private boolean setPropertyWithSanityCheck(PlayerProperty prop, int value, boolean sendPacket) {
++        if (prop == null) return false;
++        if (prop == PlayerProperty.PROP_CUR_PHLOGISTON) value = Math.max(0, Math.min(10000, value));
+         var currentValue = this.properties.getOrDefault(prop.getId(), 0);
+ 
+         var event = new PlayerPropertyChangeEvent(this, prop, currentValue, value);
+@@ -1698,6 +1709,9 @@
+         var max = this.getPropertyMax(prop);
+         if (min <= value && value <= max) {
+             this.properties.put(prop.getId(), value);
++            if (prop == PlayerProperty.PROP_CUR_PHLOGISTON) {
++                this.phlogistonValue = value / 100f;
++            }
+             if (sendPacket) {
+ 
+                 switch (prop) {
+--- a/src/main/java/emu/grasscutter/game/player/TeamManager.java
++++ b/src/main/java/emu/grasscutter/game/player/TeamManager.java
+@@ -379,6 +379,7 @@
+             .filter(e -> e.getIntValue() >= 2)
+             .map(e -> e.getKey())
+             .filter(elementType -> elementType.getTeamResonanceId() != 0)
++            .filter(elementType -> elementType != ElementType.Water)
+             .forEach(
+                 elementType -> {
+                     this.teamResonances.add(elementType.getTeamResonanceId());
+--- a/src/main/java/emu/grasscutter/server/packet/send/PacketAvatarSkillDepotChangeNotify.java
++++ b/src/main/java/emu/grasscutter/server/packet/send/PacketAvatarSkillDepotChangeNotify.java
+@@ -16,7 +16,8 @@
+                         .setSkillDepotId(avatar.getSkillDepotId())
+                         .setCoreProudSkillLevel(avatar.getCoreProudSkillLevel())
+                         .addAllTalentIdList(avatar.getTalentIdList())
+-                        .addAllProudSkillList(avatar.getProudSkillList())
++                        .addAllProudSkillList(emu.grasscutter.game.avatar.QuestProudSkillSyncHelper.inherent(avatar))
++                        .addAllSpecialProudSkillList(emu.grasscutter.game.avatar.QuestProudSkillSyncHelper.special(avatar))
+                         .putAllSkillLevelMap(avatar.getSkillLevelMap())
+                         .putAllProudSkillExtraLevelMap(avatar.getProudSkillBonusMap())
+                         .build();
+--- a/src/main/java/emu/grasscutter/server/packet/send/PacketPlayerEnterSceneInfoNotify.java
++++ b/src/main/java/emu/grasscutter/server/packet/send/PacketPlayerEnterSceneInfoNotify.java
+@@ -57,9 +57,9 @@
+                 .setKey(AbilityStringOuterClass.AbilityString.newBuilder().setHash(Utils.abilityHash("SGV_PlayerTeam_Phlogiston"))
+                         .setStr("SGV_PlayerTeam_Phlogiston")
+                         .build())
+-                        .setFloatValue(100)
+-                .build();
+-                player.setPhlogistonValue(100);
++                        .setFloatValue(player.getPhlogistonValue())
++                .build();
++
+ 
+         long hexCount = player.getTeamManager().getActiveTeam().stream()
+                 .filter(e -> e != null && getHexenzirkelIds().contains(e.getAvatar().getAvatarId()))
+@@ -167,7 +167,7 @@
+             depotData.getSkillsAndEnergySkill().forEach(skillId -> {
+                 var skillCfg = GameData.getAvatarSkillDataMap().get(skillId);
+                 if (skillCfg == null || skillCfg.getProudSkillGroupId() == 0) return;
+-                int level = skillLevelMap.getOrDefault(skillId, 1);
++                int level = emu.grasscutter.game.ability.SkillLevelResolver.getEffectiveSkillLevel(avatar, skillId);
+                 applyProudSkillVars(skillCfg.getProudSkillGroupId() * 100 + level, info);
+             });
+         }
