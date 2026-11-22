@@ -1,3 +1,4 @@
+import arena.install.ArenaAccount;
 import com.google.gson.*;
 import com.mongodb.client.MongoClients;
 import org.bson.Document;
@@ -13,7 +14,7 @@ public class ArtifactGrant {
     static record Validated(int itemId,int level,int mainPropId,int quantity,String command,List<Integer> affixes,JsonObject piece){}
     static JsonObject read(Path p)throws Exception{return JsonParser.parseString(Files.readString(p)).getAsJsonObject();}
     static JsonObject validate(Path root,JsonObject r)throws Exception {
-        if(r.get("uid").getAsInt()!=10001)throw new Exception("Only UID10001 is supported");
+        if(r.get("uid").getAsInt()!=ArenaAccount.uid(root))throw new Exception("Wrong test-account UID");
         int id=r.get("itemId").getAsInt(),level=r.get("level").getAsInt(),quantity=r.get("quantity").getAsInt(),mainId=r.get("mainPropId").getAsInt();
         String mode=r.get("mode").getAsString();if(!Set.of("standard","free").contains(mode))throw new Exception("Invalid mode");
         JsonObject piece=null;
@@ -25,7 +26,7 @@ public class ArtifactGrant {
         Map<Integer,JsonObject> stats=new HashMap<>();Map<Integer,Double> values=new HashMap<>();
         for(var e:piece.getAsJsonArray("subs")){var s=e.getAsJsonObject();for(var tier:s.getAsJsonArray("rolls")){var t=tier.getAsJsonObject();int tid=t.get("id").getAsInt();stats.put(tid,s);values.put(tid,t.get("value").getAsDouble());}}
         Set<Integer> seen=new HashSet<>();Map<String,Integer> counts=new LinkedHashMap<>();Map<String,Double> totals=new LinkedHashMap<>();int sum=0;
-        StringBuilder command=new StringBuilder("give @10001 "+id+" lv"+level+" x"+quantity+" "+mainId);
+        StringBuilder command=new StringBuilder("give @"+ArenaAccount.uid(root)+" "+id+" lv"+level+" x"+quantity+" "+mainId);
         for(var e:r.getAsJsonArray("affixes")){
             var a=e.getAsJsonObject();int aid=a.get("id").getAsInt(),count=a.get("count").getAsInt();
             if(!stats.containsKey(aid)||!seen.add(aid)||count<1||count>200)throw new Exception("Invalid or duplicate affix/count");
@@ -38,7 +39,7 @@ public class ArtifactGrant {
         if(counts.size()<1||counts.size()>4||counts.values().stream().anyMatch(n->n>200))throw new Exception("Expected1..4 distinct substats, at most200 rolls per stat");
         if(mode.equals("standard")&&(sum!=budget||counts.size()!=Math.min(4,budget)))throw new Exception("Standard roll budget/unique count is not satisfied");
         if(mode.equals("free")&&sum<budget)throw new Exception("Too few rolls: server would randomly fill the remaining affixes");
-        var report=new JsonObject();report.addProperty("uid",10001);report.addProperty("itemId",id);report.addProperty("level",level);report.addProperty("mainPropId",mainId);report.addProperty("quantity",quantity);report.addProperty("mode",mode);report.addProperty("totalRolls",sum);report.addProperty("standardBudget",budget);report.addProperty("command",command.toString());report.add("substatValues",JSON.toJsonTree(totals));report.addProperty("mainValue",main.getAsJsonArray("values").get(level).getAsDouble());return report;
+        var report=new JsonObject();report.addProperty("uid",ArenaAccount.uid(root));report.addProperty("itemId",id);report.addProperty("level",level);report.addProperty("mainPropId",mainId);report.addProperty("quantity",quantity);report.addProperty("mode",mode);report.addProperty("totalRolls",sum);report.addProperty("standardBudget",budget);report.addProperty("command",command.toString());report.add("substatValues",JSON.toJsonTree(totals));report.addProperty("mainValue",main.getAsJsonArray("values").get(level).getAsDouble());return report;
     }
     static List<Integer> expanded(JsonObject r){List<Integer> out=new ArrayList<>();for(var e:r.getAsJsonArray("affixes")){var a=e.getAsJsonObject();for(int i=0;i<a.get("count").getAsInt();i++)out.add(a.get("id").getAsInt());}Collections.sort(out);return out;}
     static void atomic(Path p,JsonObject value)throws Exception {
@@ -50,10 +51,10 @@ public class ArtifactGrant {
     }
     static void localOnline()throws Exception {
         var c=(HttpURLConnection)URI.create("http://127.0.0.1:8088/api/status").toURL().openConnection(Proxy.NO_PROXY);c.setConnectTimeout(3000);c.setReadTimeout(3000);
-        try(var in=c.getInputStream()){var h=JsonParser.parseString(new String(in.readAllBytes(),java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();if(h.getAsJsonObject("game").get("players").getAsInt()<1)throw new Exception("Enter the world with localtest UID10001 first");}finally{c.disconnect();}
+        try(var in=c.getInputStream()){var h=JsonParser.parseString(new String(in.readAllBytes(),java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();if(h.getAsJsonObject("game").get("players").getAsInt()<1)throw new Exception("Enter the world with the configured test account first");}finally{c.disconnect();}
     }
     static JsonObject validateBatch(Path root,JsonObject request)throws Exception {
-        if(!request.has("kind")||!request.get("kind").getAsString().equals("set")||request.get("uid").getAsInt()!=10001||!request.has("pieces")||request.getAsJsonArray("pieces").size()!=5)throw new Exception("Expected one full five-piece set for UID10001");
+        if(!request.has("kind")||!request.get("kind").getAsString().equals("set")||request.get("uid").getAsInt()!=ArenaAccount.uid(root)||!request.has("pieces")||request.getAsJsonArray("pieces").size()!=5)throw new Exception("Expected one full five-piece set for the configured UID");
         var catalog=read(root.resolve("catalog/artifacts.json"));var slots=new HashSet<String>();int setId=-1,stars=-1,level=-1;String mode=null;var plans=new JsonArray();
         for(var e:request.getAsJsonArray("pieces")) {
             var r=e.getAsJsonObject();var plan=validate(root,r);JsonObject piece=null;
@@ -63,19 +64,19 @@ public class ArtifactGrant {
             if(setId!=piece.get("setId").getAsInt()||stars!=piece.get("stars").getAsInt()||level!=r.get("level").getAsInt()||!mode.equals(r.get("mode").getAsString()))throw new Exception("Set/rarity/level/mode must match across all five pieces");
             plans.add(plan);
         }
-        var result=new JsonObject();result.addProperty("uid",10001);result.addProperty("kind","set");result.addProperty("setId",setId);result.addProperty("stars",stars);result.addProperty("quantity",5);result.add("pieces",plans);return result;
+        var result=new JsonObject();result.addProperty("uid",ArenaAccount.uid(root));result.addProperty("kind","set");result.addProperty("setId",setId);result.addProperty("stars",stars);result.addProperty("quantity",5);result.add("pieces",plans);return result;
     }
     static void capacity(Path root,com.mongodb.client.MongoCollection<Document> items,int quantity)throws Exception {
         int limit=read(root.resolve("server/config.json")).getAsJsonObject("server").getAsJsonObject("game").getAsJsonObject("gameOptions").getAsJsonObject("inventoryLimits").get("relics").getAsInt();
         var all=new ArrayList<Integer>();for(var e:JsonParser.parseString(Files.readString(root.resolve("server/resources/ExcelBinOutput/ReliquaryExcelConfigData.json"))).getAsJsonArray())all.add(e.getAsJsonObject().get("id").getAsInt());
-        long owned=items.countDocuments(new Document("ownerId",10001).append("itemId",new Document("$in",all)));
+        long owned=items.countDocuments(new Document("ownerId",ArenaAccount.uid(root)).append("itemId",new Document("$in",all)));
         if(owned+quantity>limit)throw new Exception("Artifact inventory limit would be exceeded");
     }
     // Caller holds the shared content lock across the complete batch. Once audited, never requeue.
     static JsonObject grantOne(Path root,String token,JsonObject request,JsonObject plan,com.mongodb.client.MongoCollection<Document> items)throws Exception {
         Path resultPath=root.resolve("run/artifact-results/"+token+".json");
         if(Files.exists(resultPath)){var receipt=read(resultPath);if(!receipt.getAsJsonObject("plan").equals(plan))throw new Exception("Request changed after completed grant");return receipt;}
-        int itemId=request.get("itemId").getAsInt(),quantity=request.get("quantity").getAsInt();var filter=new Document("ownerId",10001).append("itemId",itemId);
+        int itemId=request.get("itemId").getAsInt(),quantity=request.get("quantity").getAsInt();var filter=new Document("ownerId",ArenaAccount.uid(root)).append("itemId",itemId);
         Path auditPath=root.resolve("audit/artifact-grants/"+token+".json");JsonObject audit;Set<String> before=new HashSet<>();
         if(Files.exists(auditPath)) {
             audit=read(auditPath);if(!audit.getAsJsonObject("requestData").equals(request))throw new Exception("Request changed after submission");
@@ -94,7 +95,7 @@ public class ArtifactGrant {
     public static void main(String[] args) {
         JsonObject progress=null;Path progressPath=null;
         try {
-            Path root=Path.of(args[0]).toAbsolutePath().normalize();if(!root.toString().equalsIgnoreCase("E:\\Genshin-Local-Server"))throw new Exception("Unexpected root");
+            Path root=Path.of(args[0]).toAbsolutePath().normalize();ArenaAccount.toolRoot(ArenaAccount.class,root);
             String token=args[1];if(!token.matches("[a-f0-9]{32}"))throw new Exception("Invalid request token");
             var request=read(root.resolve("run/artifact-requests/"+token+".json"));boolean batch=request.has("pieces");var plan=batch?validateBatch(root,request):validate(root,request);
             if(args.length>2&&args[2].equals("plan")){System.out.println(plan);return;}
@@ -103,7 +104,7 @@ public class ArtifactGrant {
                 if(lock==null)throw new Exception("Another grant/edit is in progress");
                 Path resultPath=root.resolve("run/artifact-results/"+token+".json");if(Files.exists(resultPath)){var receipt=read(resultPath);if(!receipt.getAsJsonObject("plan").equals(plan))throw new Exception("Request changed after completion; nothing queued");System.out.println(receipt);return;}
                 try(var client=MongoClients.create("mongodb://127.0.0.1:27018/?directConnection=true&serverSelectionTimeoutMS=5000")){
-                    var db=client.getDatabase("astaps_local");if(db.getCollection("players").countDocuments(new Document("_id",10001))!=1)throw new Exception("Local player not found");var items=db.getCollection("items");
+                    var db=client.getDatabase("astaps_local");if(db.getCollection("players").countDocuments(new Document("_id",ArenaAccount.uid(root)))!=1)throw new Exception("Local player not found");var items=db.getCollection("items");
                     if(!batch){System.out.println(grantOne(root,token,request,plan,items));return;}
                     progressPath=root.resolve("audit/artifact-batches/"+token+".json");
                     if(Files.exists(progressPath)){progress=read(progressPath);if(!progress.getAsJsonObject("requestData").equals(request)||!progress.getAsJsonObject("plan").equals(plan))throw new Exception("Batch changed after submission; nothing queued");}

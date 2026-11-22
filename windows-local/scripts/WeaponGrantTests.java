@@ -14,7 +14,7 @@ public class WeaponGrantTests {
     static void rejects(Path root,int id,int lv,int r,int qty)throws Exception{try{WeaponGrant.validate(root,id,lv,r,qty);throw new AssertionError("Invalid plan accepted");}catch(AssertionError e){throw e;}catch(Exception expected){checks++;}}
     public static void main(String[] args)throws Exception{
         Path root=Path.of(args[0]);var p=WeaponGrant.validate(root,12501,90,5,3);
-        ok(p.get("command").getAsString().equals("give @10001 12501 lv90 r5 x3"),"Explicit copy count");
+        ok(p.get("command").getAsString().equals("give @"+arena.install.ArenaAccount.uid(root)+" 12501 lv90 r5 x3"),"Explicit copy count");
         ok(p.get("quantity").getAsInt()==3,"3 extra copies");
         ok(WeaponGrant.matches(new Document("level",90).append("refinement",4).append("equipCharacter",0),p),"Stored refinement is zero-based");
         ok(!WeaponGrant.matches(new Document("level",90).append("refinement",5),p),"Reject incorrect refinement");

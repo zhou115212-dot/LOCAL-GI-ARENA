@@ -1,4 +1,5 @@
 package localenergy;
+import arena.install.ArenaAccount;
 import com.google.gson.*;
 import emu.grasscutter.command.*;
 import emu.grasscutter.game.entity.*;
@@ -28,13 +29,13 @@ import emu.grasscutter.game.ability.Ability;
 import java.nio.file.*;
 import java.util.*;
 
-/** Read-only energy diagnostics for local UID 10001. No mutation or additional network listeners. */
+/** Read-only energy diagnostics for the bound local test account. No mutation or additional network listeners. */
 public final class LocalEnergyDiagnostics extends Plugin {
-    static final Path ROOT=Path.of("E:\\Genshin-Local-Server");
+    static final Path ROOT=ArenaAccount.pluginRoot(LocalEnergyDiagnostics.class);
     static final Gson JSON=new GsonBuilder().setPrettyPrinting().create();
     static LocalEnergyDiagnostics instance;
     final ArrayDeque<JsonObject> events=new ArrayDeque<>();
-    volatile long watchUntil;
+    volatile long watchUntil; volatile int watchedUid;
     static JsonArray team(Player p){
         var rows=new JsonArray();if(p==null||p.getTeamManager()==null)return rows;
         var manager=p.getTeamManager();var active=manager.getActiveTeam();
@@ -96,11 +97,11 @@ public final class LocalEnergyDiagnostics extends Plugin {
     }
     @Override public void onEnable(){
         try{
-            if(!Path.of("").toAbsolutePath().normalize().equals(ROOT.resolve("server")))throw new IllegalStateException("Expected E: local-server working directory");
+            if(!Path.of("").toAbsolutePath().normalize().equals(ROOT.resolve("server")))throw new IllegalStateException("Expected local-server working directory");
             Files.createDirectories(ROOT.resolve("run/energy-audits"));instance=this;
             CommandMap.getInstance().registerCommand("localenergyaudit",new AuditCommand());
             EventHandler.newHandler(this,ReceivePacketEvent.class,event->{
-                if(System.currentTimeMillis()>watchUntil)return;var p=event.getGameSession().getPlayer();if(p==null||p.getUid()!=10001)return;
+                if(System.currentTimeMillis()>watchUntil)return;var p=event.getGameSession().getPlayer();if(p==null||p.getUid()!=watchedUid)return;
                 try{List<AbilityInvokeEntry> invokes;
                     if(event.getPacketId()==PacketOpcodes.AbilityInvocationsNotify)invokes=AbilityInvocationsNotify.parseFrom(event.getPacketData()).getInvokesList();
                     else if(event.getPacketId()==PacketOpcodes.ClientAbilityChangeNotify)invokes=ClientAbilityChangeNotify.parseFrom(event.getPacketData()).getInvokesList();
@@ -109,12 +110,12 @@ public final class LocalEnergyDiagnostics extends Plugin {
                 }catch(Exception ignored){}
             });
             EventHandler.newHandler(this,PlayerUseSkillEvent.class,event->{
-                if(System.currentTimeMillis()>watchUntil||event.getPlayer().getUid()!=10001)return;
+                if(System.currentTimeMillis()>watchUntil||event.getPlayer().getUid()!=watchedUid)return;
                 var row=new JsonObject();row.addProperty("kind","skill-start");row.addProperty("avatarId",event.getAvatar().getAvatarId());row.addProperty("skillId",event.getSkillData().getId());record(row);
             });
             EventHandler.newHandler(this,SendPacketEvent.class,event->{
                 if(System.currentTimeMillis()>watchUntil||event.getPacket().getOpcode()!=PacketOpcodes.SceneEntityAppearNotify)return;
-                var p=event.getGameSession().getPlayer();if(p==null||p.getUid()!=10001||p.getScene()==null)return;
+                var p=event.getGameSession().getPlayer();if(p==null||p.getUid()!=watchedUid||p.getScene()==null)return;
                 try{var n=SceneEntityAppearNotify.parseFrom(event.getPacket().getData());for(var entity:n.getEntityListList()){
                     var live=p.getScene().getEntityById(entity.getEntityId());if(!(live instanceof EntityItem item))continue;
                     var data=item.getItemData();if(data==null||data.getItemUseActions()==null||data.getItemUseActions().stream().noneMatch(x->x instanceof ItemUseAddEnergy))continue;
@@ -122,20 +123,20 @@ public final class LocalEnergyDiagnostics extends Plugin {
                 }}catch(Exception ignored){}
             });
             EventHandler.newHandler(this,PlayerObtainItemEvent.class,event->{
-                if(System.currentTimeMillis()>watchUntil||event.getPlayer().getUid()!=10001)return;
+                if(System.currentTimeMillis()>watchUntil||event.getPlayer().getUid()!=watchedUid)return;
                 var item=event.getItem();var d=item.getItemData();if(d==null||d.getItemUseActions()==null||d.getItemUseActions().stream().noneMatch(a->a instanceof ItemUseAddEnergy))return;
                 var row=new JsonObject();row.addProperty("kind","pickup-after-use");row.addProperty("itemId",item.getItemId());row.addProperty("count",item.getCount());row.add("team",team(event.getPlayer()));record(row);
             });
             EventHandler.newHandler(this,SendPacketEvent.class,event->{
                 if(System.currentTimeMillis()>watchUntil||event.getPacket().getOpcode()!=PacketOpcodes.EntityFightPropChangeReasonNotify)return;
-                var p=event.getGameSession().getPlayer();if(p==null||p.getUid()!=10001)return;
+                var p=event.getGameSession().getPlayer();if(p==null||p.getUid()!=watchedUid)return;
                 try{var n=EntityFightPropChangeReasonNotify.parseFrom(event.getPacket().getData());
                     if(n.getReason()!=PropChangeReason.PropChangeReason_PROP_CHANGE_ENERGY_BALL)return;
                     var row=new JsonObject();row.addProperty("kind","particle-energy-delta");row.addProperty("entityId",n.getEntityId());row.addProperty("propId",n.getPropType());row.addProperty("delta",n.getPropDelta());record(row);
                 }catch(Exception ignored){}
             });
-            var ready=new JsonObject();ready.addProperty("pid",ProcessHandle.current().pid());ready.addProperty("readOnly",true);ready.addProperty("uid",10001);ready.addProperty("skillParticleTracing",true);
-            Files.writeString(ROOT.resolve("run/local-energy-diagnostics-ready.json"),JSON.toJson(ready));getLogger().info("Read-only energy diagnostics ready, UID10001 only; event capture off until requested");
+            var ready=new JsonObject();ready.addProperty("pid",ProcessHandle.current().pid());ready.addProperty("readOnly",true);ready.addProperty("accountBinding","run/test-account.json");ready.addProperty("skillParticleTracing",true);
+            Files.writeString(ROOT.resolve("run/local-energy-diagnostics-ready.json"),JSON.toJson(ready));getLogger().info("Read-only energy diagnostics ready, bound local test account only; event capture off until requested");
         }catch(Exception e){throw new IllegalStateException(e);}
     }
     @Override public void onDisable(){CommandMap.getInstance().unregisterCommand("localenergyaudit");watchUntil=0;instance=null;}
@@ -147,8 +148,8 @@ public final class LocalEnergyDiagnostics extends Plugin {
             if(!token.matches("[a-f0-9]{32}"))return;
             var out=new JsonObject();out.addProperty("time",java.time.Instant.now().toString());out.addProperty("readOnly",true);
             try{
-                if(target==null||target.getUid()!=10001||(sender!=null&&sender.getUid()!=10001))throw new IllegalArgumentException("Only local UID10001");
-                if(args.size()>1){int seconds=Integer.parseInt(args.get(1));if(seconds<0||seconds>120)throw new IllegalArgumentException("Watch seconds 0..120");synchronized(self){self.events.clear();self.watchUntil=System.currentTimeMillis()+seconds*1000L;}}
+                int boundUid=ArenaAccount.uid(ROOT);if(target==null||target.getUid()!=boundUid||(sender!=null&&sender.getUid()!=boundUid))throw new IllegalArgumentException("Only the bound local test account");
+                if(args.size()>1){int seconds=Integer.parseInt(args.get(1));if(seconds<0||seconds>120)throw new IllegalArgumentException("Watch seconds 0..120");synchronized(self){self.events.clear();self.watchedUid=boundUid;self.watchUntil=System.currentTimeMillis()+seconds*1000L;}}
                 out.addProperty("ok",true);out.add("team",team(target));out.addProperty("watchUntilMillis",self.watchUntil);
                 synchronized(self){out.add("recentEvents",JSON.toJsonTree(new ArrayList<>(self.events)));}
             }catch(Exception e){out.addProperty("ok",false);out.addProperty("error",e.getMessage());}

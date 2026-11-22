@@ -1,5 +1,6 @@
 package localtools;
 
+import arena.install.ArenaAccount;
 import com.google.gson.*;
 import emu.grasscutter.command.*;
 import emu.grasscutter.game.avatar.Avatar;
@@ -14,7 +15,7 @@ import java.util.*;
 
 /** In-place edits for the single local test account. No new ports, dependencies or DB shortcuts. */
 public final class LocalTestPlugin extends Plugin {
-    private static final Path ROOT = Path.of("E:\\Genshin-Local-Server");
+    private static final Path ROOT = ArenaAccount.pluginRoot(LocalTestPlugin.class);
     private static final Gson JSON = new GsonBuilder().setPrettyPrinting().create();
     private static LocalTestPlugin instance;
     private final Map<Integer, Entry> catalog = new HashMap<>();
@@ -37,7 +38,7 @@ public final class LocalTestPlugin extends Plugin {
             ready.addProperty("started", ProcessHandle.current().info().startInstant().orElseThrow().toString());
             ready.addProperty("jarHash", sha256(ROOT.resolve("server/plugins/LocalTestTools.jar")));
             atomic(ROOT.resolve("run/local-test-tools-ready.json"), ready);
-            getLogger().info("LocalTestTools ready: in-place constellations/refinement, UID10001 only");
+            getLogger().info("LocalTestTools ready: in-place constellations/refinement, bound local test account only");
         } catch (Exception ex) { throw new IllegalStateException("LocalTestTools initialization failed", ex); }
     }
     @Override public void onDisable() {
@@ -86,7 +87,7 @@ public final class LocalTestPlugin extends Plugin {
         return changes;
     }
     private JsonObject backup(String nonce, String kind, String selector, List<Change> changes) {
-        JsonObject b = new JsonObject(); b.addProperty("uid", 10001); b.addProperty("request", nonce);
+        JsonObject b = new JsonObject(); b.addProperty("uid", ArenaAccount.uid(ROOT)); b.addProperty("request", nonce);
         b.addProperty("created", java.time.Instant.now().toString()); b.addProperty("kind", kind); b.addProperty("selector", selector);
         JsonArray rows = new JsonArray();
         for (Change c : changes) {
@@ -109,7 +110,7 @@ public final class LocalTestPlugin extends Plugin {
     }
     private List<Change> restorePlan(Player p, String backupToken) throws Exception {
         JsonObject saved = JsonParser.parseString(Files.readString(ROOT.resolve("backups/edits/" + EditRules.token(backupToken) + ".json"))).getAsJsonObject();
-        if (saved.get("uid").getAsInt() != 10001) throw new IllegalArgumentException("Wrong backup account");
+        if (saved.get("uid").getAsInt() != ArenaAccount.uid(ROOT)) throw new IllegalArgumentException("Wrong backup account");
         List<Change> changes = new ArrayList<>();
         for (JsonElement element : saved.getAsJsonArray("changes")) {
             JsonObject row = element.getAsJsonObject(); int before = row.get("before").getAsInt(), after = row.get("after").getAsInt();
@@ -156,15 +157,15 @@ public final class LocalTestPlugin extends Plugin {
         String nonce = args.size() >= 3 ? args.get(2) : UUID.randomUUID().toString().replace("-", "");
         JsonObject result = new JsonObject();
         try {
-            EditRules.token(nonce); result.addProperty("request", nonce); result.addProperty("uid", 10001);
-            if (p == null || p.getUid() != 10001 || (sender != null && sender.getUid() != 10001)) throw new IllegalArgumentException("This plugin only targets localtest UID10001");
+            EditRules.token(nonce); result.addProperty("request", nonce); result.addProperty("uid", ArenaAccount.uid(ROOT));
+            if (p == null || p.getUid() != ArenaAccount.uid(ROOT) || (sender != null && sender.getUid() != ArenaAccount.uid(ROOT))) throw new IllegalArgumentException("This plugin only targets the bound local test account");
             if (p.getScene() == null || !p.getAvatars().isLoaded() || !p.getInventory().isLoaded()) throw new IllegalStateException("Enter the game world first");
             refreshCatalog(); int[] counts = new int[3]; List<Change> changes; String selector;
             if (kind.equals("restore")) {
-                if (args.isEmpty()) throw new IllegalArgumentException("Usage: localundo @10001 <backup-token> [request-token]");
+                if (args.isEmpty()) throw new IllegalArgumentException("Usage: localundo @<local-uid> <backup-token> [request-token]");
                 selector = EditRules.token(args.get(0)); changes = restorePlan(p, selector); counts[0] = changes.size();
             } else {
-                if (args.size() < 2) throw new IllegalArgumentException("Usage: localconst/localrefine @10001 <all|stars4|stars5|ID[,ID]> <level>");
+                if (args.size() < 2) throw new IllegalArgumentException("Usage: localconst/localrefine @<local-uid> <all|stars4|stars5|ID[,ID]> <level>");
                 selector = EditRules.validateSelector(args.get(0)); int level = Integer.parseInt(args.get(1)); EditRules.validateLevel(kind, level);
                 changes = plan(p, kind, selector, level, counts);
             }

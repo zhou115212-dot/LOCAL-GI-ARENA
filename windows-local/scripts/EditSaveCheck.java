@@ -1,3 +1,4 @@
+import arena.install.ArenaAccount;
 import com.google.gson.*;
 import com.mongodb.client.MongoClients;
 import org.bson.Document;
@@ -28,7 +29,7 @@ public class EditSaveCheck {
     }
     public static void main(String[] args)throws Exception {
         Path root=Path.of(args[0]).toAbsolutePath().normalize();
-        if(!root.toString().equalsIgnoreCase("E:\\Genshin-Local-Server"))throw new Exception("Wrong root");
+        ArenaAccount.toolRoot(ArenaAccount.class,root);
         System.setProperty("logback.configurationFile",root.resolve("scripts/mongo-logback.xml").toString());
         try(var client=MongoClients.create("mongodb://127.0.0.1:27018/?directConnection=true&serverSelectionTimeoutMS=5000")) {
             var db=client.getDatabase("astaps_local");
@@ -38,7 +39,7 @@ public class EditSaveCheck {
                 var data=new JsonObject();
                 for(String collection:List.of("avatars","items")) {
                     var rows=new JsonArray();
-                    for(var row:db.getCollection(collection).find(new Document("ownerId",10001)))rows.add(JsonParser.parseString(row.toJson()));
+                    for(var row:db.getCollection(collection).find(new Document("ownerId",ArenaAccount.uid(root))))rows.add(JsonParser.parseString(row.toJson()));
                     data.add(collection,rows);
                 }
                 Files.writeString(output,new GsonBuilder().setPrettyPrinting().create().toJson(data));
@@ -46,13 +47,15 @@ public class EditSaveCheck {
             }
             String token=args[1];if(!token.matches("[a-f0-9]{32}"))throw new Exception("Invalid request token");
             var receipt=JsonParser.parseString(Files.readString(root.resolve("run/edit-results/"+token+".json"))).getAsJsonObject();
+            if(receipt.get("uid").getAsInt()!=ArenaAccount.uid(root))throw new Exception("Wrong receipt account");
             if(!receipt.get("ok").getAsBoolean())throw new Exception(receipt.toString());
             if(receipt.has("backup")) {
                 var backup=JsonParser.parseString(Files.readString(root.resolve("backups/edits/"+token+".json"))).getAsJsonObject();
+                if(backup.get("uid").getAsInt()!=ArenaAccount.uid(root))throw new Exception("Wrong backup account");
                 for(var e:backup.getAsJsonArray("changes")) {
                     var row=e.getAsJsonObject();boolean avatar=row.get("kind").getAsString().equals("avatar");
                     var collection=db.getCollection(avatar?"avatars":"items");
-                    var filter=new Document("ownerId",10001).append(avatar?"avatarId":"_id",avatar?row.get("id").getAsInt():new ObjectId(row.get("objectId").getAsString()));
+                    var filter=new Document("ownerId",ArenaAccount.uid(root)).append(avatar?"avatarId":"_id",avatar?row.get("id").getAsInt():new ObjectId(row.get("objectId").getAsString()));
                     boolean found=false;
                     for(int i=0;i<120;i++) { if(verified(row,collection.find(filter).first())) {found=true;break;}Thread.sleep(100); }
                     if(!found)throw new Exception("Saved edit/invariant check not confirmed for ID "+row.get("id")+"; inspect backup and server logs before retrying.");

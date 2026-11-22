@@ -8,25 +8,25 @@ $Root = Split-Path -Parent $PSScriptRoot
 if ($Action -in @('update','apply-reviewed') -and (Test-Path -LiteralPath (Join-Path $Root 'local-edition.json'))) {
     throw '[LOCAL_EDITION_LOCK] This installation is pinned to its local version. Fetch, pull, build and update deployment were not started.'
 }
-if ($Action -in @('start','supervise') -and (Test-Path -LiteralPath (Join-Path $Root 'local-edition.json'))) {
-    . (Join-Path $PSScriptRoot 'local-edition-check.ps1')
-    [void](Test-LocalEdition -Root $Root)
+if ((Test-Path -LiteralPath (Join-Path $Root 'local-edition.json'))) {
+    throw 'Use this portable launcher only in a separate initialized installation.'
 }
 $Server = Join-Path $Root 'server'
 $StatePath = Join-Path $Root 'run\state.json'
 $env:TEMP = Join-Path $Root 'tmp'
 $env:TMP = $env:TEMP
 $env:GRADLE_USER_HOME = Join-Path $Root 'cache\gradle'
-$Paths = Get-Content -LiteralPath (Join-Path $Root 'runtime-paths.json') -Raw | ConvertFrom-Json
+$Paths = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $Root 'runtime-paths.json') -Raw | ConvertFrom-Json
 $Java = $Paths.java
 $Mongod = $Paths.mongod
 $env:JAVA_HOME = Split-Path -Parent (Split-Path -Parent $Java)
 $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
-$env:JAVA_TOOL_OPTIONS = "-Djava.io.tmpdir=$env:TEMP -Duser.home=$Root\cache\java-home"
+$env:_JAVA_OPTIONS=$null; $env:JDK_JAVA_OPTIONS=$null
+$env:JAVA_TOOL_OPTIONS = '"-Djava.io.tmpdir='+$env:TEMP+'" "-Duser.home='+$Root+'\cache\java-home"'
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 function Read-State {
     if (Test-Path -LiteralPath $StatePath) {
-        return Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+        return Get-Content -Encoding UTF8 -LiteralPath $StatePath -Raw | ConvertFrom-Json
     }
     return $null
 }
@@ -56,7 +56,7 @@ function Http-Status {
     } finally { $response.Dispose() }
 }
 function Validate-LocalConfig {
-    $c = Get-Content -LiteralPath "$Server\config.json" -Raw | ConvertFrom-Json
+    $c = Get-Content -Encoding UTF8 -LiteralPath "$Server\config.json" -Raw | ConvertFrom-Json
     if ($c.server.http.bindAddress -ne '127.0.0.1' -or $c.server.game.bindAddress -ne '127.0.0.1') {
         throw 'Localhost-only binding is required by this installation.'
     }
@@ -69,6 +69,8 @@ function Validate-LocalConfig {
             throw 'Unexpected database endpoint or database name.'
         }
     }
+    if ($c.version -ne 15 -or $c.server.runMode -ne 'HYBRID' -or $c.server.http.encryption.useEncryption -or $c.server.http.encryption.useInRouting -or $c.server.dispatch.regions.Count -gt 0 -or $c.server.dispatch.dispatchUrl -ne 'ws://127.0.0.1:1111') {throw 'Unexpected run mode, configuration version or remote routing.'}
+    if ($c.server.http.accessPort -ne 8088 -or $c.server.game.accessPort -ne 22101) {throw 'Unexpected advertised ports.'}
     if (-not $c.server.game.enableConsole) { throw 'Console must stay enabled for graceful stopping.' }
     return $c
 }
@@ -78,7 +80,10 @@ function Queue-Command([string]$text) {
         throw 'Enter one console command per call.'
     }
     $name = (Get-Date -Format 'yyyyMMddHHmmssfff') + '-' + [guid]::NewGuid().ToString() + '.txt'
-    [IO.File]::WriteAllText((Join-Path $Root "run\commands\$name"), $text, $Utf8)
+    $target=Join-Path $Root "run\commands\$name"
+    $secretCmd=($text -match '^(?:/?account\s+(?:create|resetpass)|/?(?:stop|shutdown))\s')
+    if($secretCmd){$target=[IO.Path]::ChangeExtension($target,'sealed');$text=ConvertFrom-SecureString (ConvertTo-SecureString $text -AsPlainText -Force)}
+    [IO.File]::WriteAllText($target+'.tmp', $text, $Utf8); [IO.File]::Move($target+'.tmp',$target)
 }
 function New-HiddenProcess([string]$exe,[string]$arguments,[bool]$redirect) {
     $info = New-Object System.Diagnostics.ProcessStartInfo
@@ -139,20 +144,13 @@ function Stop-LocalServer {
     }
     Write-Host 'Local server and its MongoDB are stopped.'
 }
-function Git-Local([string]$repo,[string[]]$arguments) {
-    $proxy = [System.Net.WebRequest]::DefaultWebProxy.GetProxy([uri]'https://github.com/').AbsoluteUri
-    if ($proxy -ne 'https://github.com/') {
-        & $Paths.git -c "http.proxy=$proxy" -c http.version=HTTP/1.1 -C $repo @arguments
-    } else { & $Paths.git -C $repo @arguments }
-    if ($LASTEXITCODE -ne 0) { throw 'Git command failed.' }
-}
 switch ($Action) {
     'status' { Show-Status }
     'command' {
         Queue-Command $CommandText
         Write-Host 'Command queued; output below and in server logs.'
         Start-Sleep -Seconds 2
-        if (Test-Path "$Server\logs\latest.log") { Get-Content -LiteralPath "$Server\logs\latest.log" -Tail 25 | Out-Host }
+        if (Test-Path "$Server\logs\latest.log") { Get-Content -Encoding UTF8 -LiteralPath "$Server\logs\latest.log" -Tail 25 | Out-Host }
     }
     'stop' { Stop-LocalServer }
     'start' {
@@ -173,7 +171,14 @@ switch ($Action) {
         $ready = $false
         for ($i=0; $i -lt 300; $i++) {
             if ($hostProcess.HasExited) { throw "Startup stopped. Read $Root\logs\supervisor.err.log and $Server\logs\latest.log" }
-            try { $status = Http-Status; if (Game-Process) { $ready=$true; break } } catch {}
+            try {
+                $proc=Game-Process
+                if ($proc) {
+                    $httpOwner=@(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 8088 -State Listen -OwningProcess $proc.Id -ErrorAction SilentlyContinue)
+                    $udpOwner=@(Get-NetUDPEndpoint -LocalAddress '127.0.0.1' -LocalPort 22101 -OwningProcess $proc.Id -ErrorAction SilentlyContinue)
+                    if($httpOwner.Count -and $udpOwner.Count -and ((Http-Status |ConvertFrom-Json).game -ne $null)){ $ready=$true;break }
+                }
+            } catch {}
             Start-Sleep -Seconds 1
         }
         if (-not $ready) { throw 'Startup is still in progress; inspect logs. No process has been force-stopped.' }
@@ -189,6 +194,8 @@ switch ($Action) {
             $occupied = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in @(27018,8088) })
             $udp = @(Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq 22101 })
             if ($occupied.Count -or $udp.Count) { throw 'An installation port is occupied. Existing processes were left untouched.' }
+            # Never replay sensitive queued commands after a restart.
+            Get-ChildItem -LiteralPath "$Root\run\commands" -Filter '*.sealed' -File | ForEach-Object {Remove-Item -LiteralPath $_.FullName}
             # Archive unconsumed commands from any previous session; never replay stale commands.
             Get-ChildItem -LiteralPath "$Root\run\commands" -Filter *.txt | ForEach-Object {
                 Move-Item -LiteralPath $_.FullName -Destination (Join-Path "$Root\run\processed" ('stale-' + $_.Name))
@@ -203,18 +210,20 @@ switch ($Action) {
             }
             if (-not $connected) { throw 'MongoDB startup timed out.' }
             Mongo-Command 'ping'
-            $game = New-HiddenProcess $Java ('-Xms512m -Xmx8g -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai -jar "' + $Server + '\grasscutter.jar"') $true
+            $game = New-HiddenProcess $Java ('-Xms512m -Xmx8g -Djava.net.preferIPv4Stack=true -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai -jar "' + $Server + '\grasscutter.jar"') $true
             $state = [ordered]@{
                 javaPid=$game.Id; javaStarted=$game.StartTime.ToUniversalTime().Ticks
                 mongoPid=$db.Id; mongoStarted=$db.StartTime.ToUniversalTime().Ticks
-                supervisorPid=$PID; running=$true
+                supervisorPid=$PID; supervisorStarted=(Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks; running=$true
             }
             $state | ConvertTo-Json | Set-Content -LiteralPath $StatePath -Encoding UTF8
             $streams = @($game.StandardOutput,$game.StandardError)
             $tasks = @($streams[0].ReadLineAsync(),$streams[1].ReadLineAsync())
             $done = @($false,$false)
             $clientLifecycle=New-LocalClientLifecycle
-            $clientPath=Join-Path $Root 'client\Genshin-7.1-CN\YuanShen.exe'
+            $clientPath=$null
+            $selection=Join-Path $Root 'run/client-selection.json'
+            if(Test-Path -LiteralPath $selection){ $clientPath=(Get-Content -Encoding UTF8 -Raw -LiteralPath $selection|ConvertFrom-Json).executable }
             $lifecycleClock=[Diagnostics.Stopwatch]::StartNew()
             $nextClientProbe=0.0
             $autoStopAt=$null
@@ -229,17 +238,22 @@ switch ($Action) {
                     }
                 }
                 if (-not $game.HasExited) {
-                    Get-ChildItem -LiteralPath "$Root\run\commands" -Filter *.txt | Sort-Object Name | ForEach-Object {
+                    Get-ChildItem -LiteralPath "$Root\run\commands" -File | Where-Object {$_.Extension -in '.txt','.sealed'} | Sort-Object Name | ForEach-Object {
                         $text = [IO.File]::ReadAllText($_.FullName, $Utf8).Trim()
+                        if($_.Extension -eq '.sealed'){
+                            $secure=ConvertTo-SecureString $text
+                            try{$text=([System.Net.NetworkCredential]::new('',$secure)).Password}finally{$secure.Dispose()}
+                        }
                         if ($text -and -not $text.Contains("`n") -and -not $text.Contains("`r")) {
                             $game.StandardInput.WriteLine($text)
                             $game.StandardInput.Flush()
                         }
-                        # Command content is archived locally; this may include locally created test passwords.
-                        Move-Item -LiteralPath $_.FullName -Destination (Join-Path "$Root\run\processed" $_.Name)
+                        if($_.Extension -eq '.sealed' -or $text -match '^(?:/?account\s+(?:create|resetpass)|/?(?:stop|shutdown))\s'){
+                            Remove-Item -LiteralPath $_.FullName
+                        }else{Move-Item -LiteralPath $_.FullName -Destination (Join-Path "$Root\run\processed" $_.Name)}
                     }
                     $now=$lifecycleClock.Elapsed.TotalSeconds
-                    if ($now -ge $nextClientProbe -and -not $clientLifecycle.StopAttempted) {
+                    if ($clientPath -and $now -ge $nextClientProbe -and -not $clientLifecycle.StopAttempted) {
                         $nextClientProbe=$now+2
                         $presence=Get-IsolatedClientPresence -ExpectedPath $clientPath
                         if (Update-LocalClientLifecycle -State $clientLifecycle -ClientPresent $presence.Present -ProbeSucceeded $presence.Succeeded -NowSeconds $now -GraceSeconds 30) {
@@ -268,7 +282,7 @@ switch ($Action) {
             }
             Write-Host "AstaPS exited: $($game.ExitCode)"
         } finally {
-            if ($db -and -not $db.HasExited) {
+            if ($db -and -not $db.HasExited -and (-not $game -or $game.HasExited)) {
                 Mongo-Command 'shutdown'
                 [void]$db.WaitForExit(30000)
             }
@@ -277,99 +291,5 @@ switch ($Action) {
             $mutex.ReleaseMutex(); $mutex.Dispose()
         }
     }
-    'update' {
-        $review = [ordered]@{}
-        foreach ($name in @('source','server\resources')) {
-            $repo = Join-Path $Root $name
-            Git-Local $repo @('fetch','origin','main')
-            $sha = (& $Paths.git -C $repo rev-parse origin/main).Trim()
-            $review[$name]=$sha
-            $label=$name.Replace('\','-')
-            & $Paths.git -C $repo diff HEAD origin/main | Set-Content -LiteralPath "$Root\audit\update-$label.diff" -Encoding UTF8
-            & $Paths.git -C $repo diff HEAD origin/main -- '*.bat' '*.cmd' '*.ps1' '*.sh' '*gradle*' '*.yml' '*.yaml' '*README*' | Set-Content -LiteralPath "$Root\audit\update-$label-scripts.diff" -Encoding UTF8
-            & $Paths.git -C $repo log --oneline HEAD..origin/main | Out-Host
-        }
-        $review | ConvertTo-Json | Set-Content -LiteralPath "$Root\audit\update-reviewed-refs.json" -Encoding UTF8
-        Write-Host 'Fetched only; running server unchanged. Read audit\update-*.diff before applying.'
-        Write-Host 'After reviewing changed scripts and source, run: update-server.bat apply-reviewed'
-    }
-    'apply-reviewed' {
-        # Binary-local fixes must be migrated/replayed, never silently overwritten by upstream.
-        if (@(Get-ChildItem -LiteralPath "$Root\run" -Filter '*-deployed.json').Count -gt 0 -and
-                -not (Test-Path -LiteralPath "$Root\run\local-patch-registry.json")) {
-            throw 'Local fixes are installed but no tested patch registry is active. Preserve/review them before updating; running server unchanged.'
-        }
-        # Never interrupt a live test session to update, and never replace or wipe its database.
-        $clientStatePath=Join-Path $Root 'run\client-state.json'
-        if(Test-Path -LiteralPath $clientStatePath){
-            $cs=Get-Content -LiteralPath $clientStatePath -Raw | ConvertFrom-Json
-            if(Owned-Process $cs.pid $cs.startedTicks (Join-Path $Root 'client\Genshin-7.1-CN\YuanShen.exe')){throw 'Exit the isolated game before applying updates. Server and saved data are unchanged.'}
-        }
-        $remoteConstants=& $Paths.git -C "$Root\source" show 'origin/main:src/main/java/emu/grasscutter/GameConstants.java'
-        $versionMatch=[regex]::Match(($remoteConstants -join "`n"),'String\s+VERSION\s*=\s*"([^"]+)"')
-        if(-not $versionMatch.Success-or $versionMatch.Groups[1].Value -ne '7.1.0'){
-            throw 'Upstream requires a different or unrecognized client version. Keep this working 7.1.0 installation and database; review a matching isolated client and patch first.'
-        }
-        $review = Get-Content -LiteralPath "$Root\audit\update-reviewed-refs.json" -Raw | ConvertFrom-Json
-        foreach ($name in @('source','server\resources')) {
-            $repo = Join-Path $Root $name
-            if ((& $Paths.git -C $repo rev-parse origin/main).Trim() -ne $review.$name) { throw 'Fetched ref differs from reviewed ref; run update again.' }
-            $dirty = & $Paths.git -C $repo status --porcelain
-            if ($dirty) { throw "Local changes in $repo; preserve and review them first." }
-        }
-        Stop-LocalServer
-        $backup = Join-Path $Root ('backups\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
-        New-Item -ItemType Directory -Path $backup | Out-Null
-        Copy-Item -LiteralPath "$Server\config.json","$Server\grasscutter.jar" -Destination $backup
-        Copy-Item -LiteralPath "$Root\database" -Destination "$backup\database" -Recurse
-        foreach ($name in @('source','server\resources')) {
-            $repo=Join-Path $Root $name
-            (& $Paths.git -C $repo rev-parse HEAD) | Set-Content -LiteralPath "$backup\$($name.Replace('\','-'))-old-commit.txt"
-            Git-Local $repo @('pull','--ff-only','origin','main')
-            if ((& $Paths.git -C $repo rev-parse HEAD).Trim() -ne $review.$name) { throw 'Remote changed during pull. New source remains stopped; run update and review again.' }
-        }
-        $proxy = [System.Net.WebRequest]::DefaultWebProxy.GetProxy([uri]'https://plugins.gradle.org/').AbsoluteUri
-        $gradleArgs=@('jar','-PskipHandbook=1','-PjarFilename=grasscutter','-Dorg.gradle.jvmargs=-Xmx4g','--no-daemon','--console=plain')
-        if ($proxy -ne 'https://plugins.gradle.org/') {
-            $pu=[uri]$proxy
-            $gradleArgs += @("-Dhttps.proxyHost=$($pu.Host)","-Dhttps.proxyPort=$($pu.Port)","-Dhttp.proxyHost=$($pu.Host)","-Dhttp.proxyPort=$($pu.Port)")
-        }
-        Push-Location "$Root\source"
-        try {
-            $oldPreference = $ErrorActionPreference
-            try {
-                $ErrorActionPreference='Continue'
-                # Combine native stdout/stderr inside cmd so Windows PowerShell does not
-                # mislabel Java's JAVA_TOOL_OPTIONS notice as a NativeCommandError.
-                $quotedArgs = @($gradleArgs | ForEach-Object { '"' + $_ + '"' }) -join ' '
-                $buildLine = '"' + $Root + '\source\gradlew.bat" ' + $quotedArgs + ' 2>&1'
-                & $env:ComSpec /d /c $buildLine | Tee-Object -FilePath "$Root\logs\update-build.log"
-                $buildExit=$LASTEXITCODE
-            } finally { $ErrorActionPreference=$oldPreference }
-            if ($buildExit -ne 0) { throw "Build failed; previous deployed jar retained. Backup: $backup" }
-        } finally { Pop-Location }
-        $incomingJar = "$Root\source\grasscutter.jar"
-        if (Test-Path -LiteralPath "$Root\run\local-patch-registry.json") {
-            $patchedJar = "$Root\run\update-with-local-fixes.jar"
-            & "$Root\scripts\preserve-local-patches.ps1" -InputJar $incomingJar -OutputJar $patchedJar
-            & "$Root\scripts\test-unified-candidate.ps1" -Jar $patchedJar -LogDir "$Root\audit\update-local-fix-regressions"
-            $incomingJar = $patchedJar
-        }
-        Copy-Item -LiteralPath $incomingJar -Destination "$Server\grasscutter.jar" -Force
-        foreach ($d in @('data','lua','webstatic')) { Copy-Item -Path "$Root\source\$d\*" -Destination "$Server\$d" -Recurse -Force }
-        $upstreamThai = & $Paths.git -C "$Server\resources" ls-files TextMap/TextMapTH.json
-        if (-not $upstreamThai -and (Test-Path "$Server\resources\TextMap\TextMapTH_1.json") -and (Test-Path "$Server\resources\TextMap\TextMapTH_2.json")) {
-            & $Paths.node "$Root\scripts\merge-textmap.cjs"
-            if ($LASTEXITCODE -ne 0) { throw 'Thai map overlay requires review. Server remains stopped.' }
-        }
-        Write-Host "Updated, still stopped. Backup: $backup. Run start-server.bat to verify."
-        if((Test-Path -LiteralPath "$Root\scripts\build-id-catalog.cjs")-and(Test-Path -LiteralPath "$Root\name-data\src\data\ChineseSimplified\characters")){
-            & $Paths.node "$Root\scripts\build-id-catalog.cjs"
-            if($LASTEXITCODE -ne 0){throw 'Server update deployed, but the local ID catalog needs repair before using missing-content grants. Backup is retained.'}
-        }
-        if(Test-Path -LiteralPath "$Root\scripts\build-local-test-tools.ps1"){
-            & "$Root\scripts\build-local-test-tools.ps1"
-            if($LASTEXITCODE -ne 0){throw 'Updated server remains stopped; rebuild LocalTestTools before using editor commands.'}
-        }
-    }
+    default { throw 'This edition is pinned. Install updates in a separate directory and back up your local save before migrating.' }
 }

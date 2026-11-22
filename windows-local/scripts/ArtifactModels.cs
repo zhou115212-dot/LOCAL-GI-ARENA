@@ -5,6 +5,18 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Web.Script.Serialization;
 
+public static class ArenaBinding {
+    public static int Uid {get; private set;}
+    public static void Bind(string root) {
+        var path=Path.Combine(root,"run","test-account.json");
+        if(!File.Exists(path)||new FileInfo(path).Length>8192)throw new InvalidDataException("请先在本次安装中创建本地测试账号。");
+        var row=new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(File.ReadAllText(path));
+        object uid,user;
+        if(row==null||!row.TryGetValue("uid",out uid)||!(uid is int)||(int)uid<=0||!row.TryGetValue("username",out user)||!(user is string)||String.IsNullOrWhiteSpace((string)user))throw new InvalidDataException("本地测试账号配置无效。");
+        if(Uid!=0&&Uid!=(int)uid)throw new InvalidDataException("账号绑定已变化，请重新打开控制器。");
+        Uid=(int)uid;
+    }
+}
 public class ArtifactCatalog { public List<ArtifactSet> sets; public List<ArtifactPiece> pieces; public string gameVersion; }
 public class ArtifactSet { public int id; public string name,twoPiece,fourPiece; public override string ToString(){return name+" · "+id;} }
 public class ArtifactPiece { public int id,setId,stars,initial,maxLevel;public string slot,slotName,name;public List<ArtifactMain> mains;public List<ArtifactSub> subs; }
@@ -12,8 +24,8 @@ public class ArtifactMain { public int id;public string prop,label;public bool p
 public class ArtifactSub { public string prop,label;public bool percent;public List<ArtifactRoll> rolls;public override string ToString(){return label;} }
 public class ArtifactRoll { public int id;public double value; }
 public class AffixCount {public int id,count;}
-public class ArtifactRequest {public int uid=10001,itemId,level,mainPropId,quantity=1;public string mode="standard";public List<AffixCount> affixes=new List<AffixCount>();}
-public class ArtifactSetRequest {public int uid=10001;public string kind="set";public List<ArtifactRequest> pieces=new List<ArtifactRequest>();}
+public class ArtifactRequest {public int uid=ArenaBinding.Uid,itemId,level,mainPropId,quantity=1;public string mode="standard";public List<AffixCount> affixes=new List<AffixCount>();}
+public class ArtifactSetRequest {public int uid=ArenaBinding.Uid;public string kind="set";public List<ArtifactRequest> pieces=new List<ArtifactRequest>();}
 public class ArtifactReceipt {public bool ok;public int added;public List<string> objectIds;public string request,command;}
 
 public static class ArtifactMath {
@@ -31,7 +43,7 @@ public static class ArtifactMath {
         Validate(p,r);return r;
     }
     public static void ValidateSet(ArtifactCatalog catalog,ArtifactSetRequest batch) {
-        if(batch==null||batch.uid!=10001||batch.kind!="set"||batch.pieces==null||batch.pieces.Count!=5)throw new ArgumentException("五件套需要五个不同部位，各1件。");
+        if(ArenaBinding.Uid<=0||batch==null||batch.uid!=ArenaBinding.Uid||batch.kind!="set"||batch.pieces==null||batch.pieces.Count!=5)throw new ArgumentException("五件套需要五个不同部位，各1件。");
         var slots=new HashSet<string>();int setId=-1,stars=-1,level=-1;string mode=null;
         foreach(var r in batch.pieces){var p=catalog.pieces.FirstOrDefault(x=>x.id==r.itemId);Validate(p,r);
             if(r.quantity!=1||!Slots.Contains(p.slot)||!slots.Add(p.slot))throw new ArgumentException("五件套必须每个部位各1件。");
@@ -52,10 +64,10 @@ public static class ArtifactMath {
         }return result;
     }
     public static string Command(ArtifactRequest request) {
-        return "give @10001 "+request.itemId+" lv"+request.level+" x"+request.quantity+" "+request.mainPropId+" "+String.Join(" ",request.affixes.Select(a=>a.id+","+a.count));
+        return "give @"+request.uid+" "+request.itemId+" lv"+request.level+" x"+request.quantity+" "+request.mainPropId+" "+String.Join(" ",request.affixes.Select(a=>a.id+","+a.count));
     }
     public static void Validate(ArtifactPiece piece,ArtifactRequest r) {
-        if(r.uid!=10001||piece==null||piece.id!=r.itemId||r.quantity<1||r.quantity>5||r.level<0||r.level>piece.maxLevel)throw new ArgumentException("请选择有效圣遗物、等级以及1–5件数量。");
+        if(ArenaBinding.Uid<=0||r.uid!=ArenaBinding.Uid||piece==null||piece.id!=r.itemId||r.quantity<1||r.quantity>5||r.level<0||r.level>piece.maxLevel)throw new ArgumentException("请选择有效圣遗物、等级以及1–5件数量。");
         var main=piece.mains.FirstOrDefault(m=>m.id==r.mainPropId);if(main==null)throw new ArgumentException("主词条与部位不匹配。");
         if(r.mode!="standard"&&r.mode!="free")throw new ArgumentException("无效生成模式。");
         var props=new HashSet<string>();var ids=new HashSet<int>();var totals=new Dictionary<string,int>();int sum=0;

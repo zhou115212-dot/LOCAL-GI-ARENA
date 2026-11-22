@@ -21,7 +21,7 @@ class WeaponCopiesGuiTest {
                 category.SelectedIndex=1;Check(!command.Text.EndsWith("x7"),"Avatar commands are not changed to weapon copy count");
                 category.SelectedIndex=4;qty.Value=3;f.ShowInTaskbar=false;f.StartPosition=FormStartPosition.Manual;f.Location=new Point(-20000,-20000);f.Show();Application.DoEvents();f.PerformLayout();
                 Check(qty.Visible&&qty.Bottom<qty.Parent.ClientSize.Height,"New quantity row visible without clipping");
-                using(var image=new Bitmap(f.Width,f.Height)){f.DrawToBitmap(image,new Rectangle(0,0,image.Width,image.Height));image.Save("E:\\Genshin-Local-Server\\audit\\weapon-copies-ui.png");}
+                using(var image=new Bitmap(f.Width,f.Height)){f.DrawToBitmap(image,new Rectangle(0,0,image.Width,image.Height));var audit=System.IO.Path.GetFullPath(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"..","..","audit"));System.IO.Directory.CreateDirectory(audit);image.Save(System.IO.Path.Combine(audit,"weapon-copies-ui.png"));}
                 f.Close();
             }
             Console.WriteLine("PASS "+checks+" GUI checks; no buttons clicked, grants or live changes.");return 0;

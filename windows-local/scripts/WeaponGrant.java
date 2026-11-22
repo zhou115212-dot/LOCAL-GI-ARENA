@@ -1,3 +1,4 @@
+import arena.install.ArenaAccount;
 import com.google.gson.*;
 import com.mongodb.client.MongoClients;
 import org.bson.Document;
@@ -21,16 +22,16 @@ public class WeaponGrant {
         if(named==null||weapon==null)throw new Exception("Select a named weapon present in the installed resources");
         boolean canRefine=false;for(var a:weapon.getAsJsonArray("skillAffix"))if(a.getAsInt()>0)canRefine=true;
         if(!canRefine&&refine!=1)throw new Exception("This weapon has no refinement effect; choose refinement 1");
-        var p=new JsonObject();p.addProperty("uid",10001);p.addProperty("itemId",id);p.addProperty("name",named.get("name").getAsString());
+        var p=new JsonObject();p.addProperty("uid",ArenaAccount.uid(root));p.addProperty("itemId",id);p.addProperty("name",named.get("name").getAsString());
         p.addProperty("level",level);p.addProperty("refinement",refine);p.addProperty("quantity",quantity);
-        p.addProperty("command","give @10001 "+id+" lv"+level+" r"+refine+" x"+quantity);return p;
+        p.addProperty("command","give @"+ArenaAccount.uid(root)+" "+id+" lv"+level+" r"+refine+" x"+quantity);return p;
     }
     static boolean matches(Document row,JsonObject plan){return row.getInteger("level",1)==plan.get("level").getAsInt()&&row.getInteger("refinement",0)+1==plan.get("refinement").getAsInt()&&row.getInteger("equipCharacter",0)==0;}
     static void atomic(Path p,JsonObject value)throws Exception{
         Files.createDirectories(p.getParent());Path temp=p.resolveSibling(p.getFileName()+".tmp");Files.writeString(temp,JSON.toJson(value));Files.move(temp,p,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);
     }
     public static void main(String[] args){try{
-        Path root=Path.of(args[0]).toAbsolutePath().normalize();if(!root.toString().equalsIgnoreCase("E:\\Genshin-Local-Server"))throw new Exception("Unexpected root");
+        Path root=Path.of(args[0]).toAbsolutePath().normalize();ArenaAccount.toolRoot(ArenaAccount.class,root);
         String token=args[1];if(!token.matches("[a-f0-9]{32}"))throw new Exception("Invalid request ID");
         var plan=validate(root,Integer.parseInt(args[2]),Integer.parseInt(args[3]),Integer.parseInt(args[4]),Integer.parseInt(args[5]));
         if(args.length>6&&args[6].equals("plan")){System.out.println(JSON.toJson(plan));return;}
@@ -40,13 +41,13 @@ public class WeaponGrant {
             if(lock==null)throw new Exception("Another content grant is running");
             if(Files.exists(result)){var receipt=read(result);if(!receipt.getAsJsonObject("plan").equals(plan))throw new Exception("Completed request has different settings");System.out.println(JSON.toJson(receipt));return;}
             try(var mongo=MongoClients.create("mongodb://127.0.0.1:27018/?directConnection=true&serverSelectionTimeoutMS=5000")){
-                var items=mongo.getDatabase("astaps_local").getCollection("items");var filter=new Document("ownerId",10001).append("itemId",plan.get("itemId").getAsInt());
+                var items=mongo.getDatabase("astaps_local").getCollection("items");var filter=new Document("ownerId",ArenaAccount.uid(root)).append("itemId",plan.get("itemId").getAsInt());
                 var before=new HashSet<String>();JsonObject audit;
                 if(Files.exists(auditPath)){audit=read(auditPath);if(!audit.getAsJsonObject("plan").equals(plan))throw new Exception("Submitted request has different settings");for(var v:audit.getAsJsonArray("beforeIds"))before.add(v.getAsString());}
                 else{
                     var weaponIds=new ArrayList<Integer>();for(var v:JsonParser.parseString(Files.readString(root.resolve("server/resources/ExcelBinOutput/WeaponExcelConfigData.json"))).getAsJsonArray())weaponIds.add(v.getAsJsonObject().get("id").getAsInt());
                     int limit=read(root.resolve("server/config.json")).getAsJsonObject("server").getAsJsonObject("game").getAsJsonObject("gameOptions").getAsJsonObject("inventoryLimits").get("weapons").getAsInt();
-                    if(items.countDocuments(new Document("ownerId",10001).append("itemId",new Document("$in",weaponIds)))+plan.get("quantity").getAsInt()>limit)throw new Exception("Weapon inventory capacity would be exceeded");
+                    if(items.countDocuments(new Document("ownerId",ArenaAccount.uid(root)).append("itemId",new Document("$in",weaponIds)))+plan.get("quantity").getAsInt()>limit)throw new Exception("Weapon inventory capacity would be exceeded");
                     for(var row:items.find(filter))before.add(row.getObjectId("_id").toHexString());
                     audit=new JsonObject();audit.add("plan",plan);audit.add("beforeIds",JSON.toJsonTree(before));audit.addProperty("created",java.time.Instant.now().toString());audit.addProperty("directDatabaseWrites",false);atomic(auditPath,audit);
                     // A previously audited request is never automatically submitted again.

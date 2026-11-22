@@ -1,0 +1,6 @@
+{
+  "allowNamedWeaponIds": [14505],
+  "notes": {
+    "14505": "碧落之珑: present in local 7.1 WeaponExcel, weapon-promote rows, all five EquipAffix tiers, and Chinese name data. Upstream bulk exclusion list contains this released named weapon. Only the catalog exclusion is overridden; server/client files are unchanged."
+  }
+}

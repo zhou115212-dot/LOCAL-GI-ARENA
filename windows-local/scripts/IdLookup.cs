@@ -20,6 +20,7 @@ class IdLookup : Form {
     static readonly string[] Categories={"全部","角色（全部）","四星角色","五星角色","武器（全部）","四星武器","五星武器"};
     public IdLookup() {
         root=Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"..",".."));
+        ArenaBinding.Bind(root);
         Text="原神本地测试 · 角色武器与圣遗物管理"; ClientSize=new Size(1220,800); MinimumSize=new Size(1130,650);
         StartPosition=FormStartPosition.CenterScreen; Font=new Font("Microsoft YaHei UI",10); AutoScaleMode=AutoScaleMode.Dpi;
         try { Icon=Icon.ExtractAssociatedIcon(Path.Combine(root,"client\\Genshin-7.1-CN\\YuanShen.exe")); } catch {}
@@ -93,12 +94,12 @@ class IdLookup : Form {
             int i=table.Rows.Add(e.kind,e.name,e.id,e.type,e.stars>0?e.stars+"★":"",e.named?"已核对":"内部名/未确认",e.command);table.Rows[i].Tag=e;
         }
         if(table.Rows.Count>0)table.Rows[0].Selected=true;UpdateSelection();
-        if(!busy)status.Text="当前显示 "+table.Rows.Count+" 项。修改需 localtest（UID10001）进入世界；已有角色/武器原地设置，保留等级、基础天赋、圣遗物与装备。\n同ID武器的全部副本一起改精炼；不支持精炼的武器自动跳过。每次修改先备份；降低命座可能短暂重载场景。";
+        if(!busy)status.Text="当前显示 "+table.Rows.Count+" 项。修改需 绑定的本地测试账号进入世界；已有角色/武器原地设置，保留等级、基础天赋、圣遗物与装备。\n同ID武器的全部副本一起改精炼；不支持精炼的武器自动跳过。每次修改先备份；降低命座可能短暂重载场景。";
     }
     IdEntry Selection() {return table!=null&&table.SelectedRows.Count>0?table.SelectedRows[0].Tag as IdEntry:null;}
     void UpdateSelection() {
         var e=Selection();if(command==null||selected==null)return;
-        command.Text=e==null?"":e.kind=="武器"?"give @10001 "+e.id+" lv"+(int)weaponLevel.Value+" r"+(int)refinement.Value+" x"+(int)weaponQuantity.Value:e.command;
+        command.Text=e==null?"":e.kind=="武器"?"give @"+ArenaBinding.Uid+" "+e.id+" lv"+(int)weaponLevel.Value+" r"+(int)refinement.Value+" x"+(int)weaponQuantity.Value:e.command;
         selected.Text=e==null?"选中：—":"选中："+e.name+" · "+e.id+" · "+e.stars+"★ · "+e.kind+"（下面的数值是准备设置的目标，不代表当前存档数值）";
     }
     void SelectedEdit(string kind,int level) {
@@ -110,7 +111,7 @@ class IdLookup : Form {
         if(busy)return;var e=Selection();
         if(e==null||e.kind!="武器"||!e.named){MessageBox.Show("请先搜索并选中一项已核对名称的武器。","选择武器");return;}
         string details=e.name+"（"+e.id+"）\n额外新增 "+(int)weaponQuantity.Value+" 把 · 等级 "+(int)weaponLevel.Value+" · 精炼 "+(int)refinement.Value;
-        if(MessageBox.Show(details+"\n\n已有副本及装备不变，不消耗材料。请保持UID10001在线，等待完成期间不要同时发放同一武器。继续吗？","新增武器副本",MessageBoxButtons.YesNo,MessageBoxIcon.Question)!=DialogResult.Yes)return;
+        if(MessageBox.Show(details+"\n\n已有副本及装备不变，不消耗材料。请保持本地测试账号在线，等待完成期间不要同时发放同一武器。继续吗？","新增武器副本",MessageBoxButtons.YesNo,MessageBoxIcon.Question)!=DialogResult.Yes)return;
         Run("weapon-control.ps1","-RequestId "+Guid.NewGuid().ToString("N")+" -ItemId "+e.id+" -Level "+(int)weaponLevel.Value+" -Refinement "+(int)refinement.Value+" -Quantity "+(int)weaponQuantity.Value,false,true);
     }
     void FilteredEdit(string kind,int level) {
@@ -121,19 +122,19 @@ class IdLookup : Form {
     }
     void Edit(string kind,string selector,int level,string description) {
         if(busy)return;
-        string text=description+"\n\n只修改已拥有内容，不新增角色/武器，不消耗材料。\n保留等级、基础天赋、装备和圣遗物。武器同ID全部副本生效；无精炼属性的武器跳过。\n每次有变更都会在E盘保存原命座/精炼，支持撤销。\n降低命座可能短暂重载当前场景。请保持UID10001在线，操作完成前不要同时手动发放或强化。继续吗？";
+        string text=description+"\n\n只修改已拥有内容，不新增角色/武器，不消耗材料。\n保留等级、基础天赋、装备和圣遗物。武器同ID全部副本生效；无精炼属性的武器跳过。\n每次有变更都会在本安装目录保存原命座/精炼，支持撤销。\n降低命座可能短暂重载当前场景。请保持本地测试账号在线，操作完成前不要同时手动发放或强化。继续吗？";
         if(MessageBox.Show(text,"确认本地存档修改",MessageBoxButtons.YesNo,MessageBoxIcon.Question)!=DialogResult.Yes)return;
         Run("edit-content.ps1","-Kind "+kind+" -Selector \""+selector+"\" -Level "+level,true);
     }
     void Undo() {
         if(busy)return;
-        if(MessageBox.Show("恢复上一次操作涉及的命座/精炼，不恢复角色等级或其他游戏进度。\n若这些条目的命座/精炼后来又变过，或旅行者切换了元素，撤销会停止并保留现状。\n请保持UID10001在线。继续吗？","撤销上一次修改",MessageBoxButtons.YesNo,MessageBoxIcon.Question)!=DialogResult.Yes)return;
+        if(MessageBox.Show("恢复上一次操作涉及的命座/精炼，不恢复角色等级或其他游戏进度。\n若这些条目的命座/精炼后来又变过，或旅行者切换了元素，撤销会停止并保留现状。\n请保持本地测试账号在线。继续吗？","撤销上一次修改",MessageBoxButtons.YesNo,MessageBoxIcon.Question)!=DialogResult.Yes)return;
         Run("edit-content.ps1","-Kind restore -Selector last",true);
     }
     void Grant(string action) {
         if(busy)return;
-        if(MessageBox.Show("请确认localtest（UID10001）已经进入世界。\n只补齐缺少内容：新角色90级/0命/基础天赋9级，新武器90级/精1/每种一把。\n已有角色配置和同ID武器跳过，未确认名称的内部条目不发放。\n操作完成前不要同时手动发放。继续吗？","确认补齐",MessageBoxButtons.YesNo,MessageBoxIcon.Question)!=DialogResult.Yes)return;
-        Run("client-control.ps1","-Action "+action,false);
+        if(MessageBox.Show("请确认绑定的本地测试账号已经进入世界。\n只补齐缺少内容：新角色90级/0命/基础天赋9级，新武器90级/精1/每种一把。\n已有角色配置和同ID武器跳过，未确认名称的内部条目不发放。\n操作完成前不要同时手动发放。继续吗？","确认补齐",MessageBoxButtons.YesNo,MessageBoxIcon.Question)!=DialogResult.Yes)return;
+        Run("fill-content.ps1","-Action "+action,false);
     }
     void Run(string script,string arguments,bool edit,bool weapon=false) {
         busy=true;foreach(var b in actionButtons)b.Enabled=false;artifactDesigner.SetExternalBusy(true);artifactSetDesigner.SetExternalBusy(true);
